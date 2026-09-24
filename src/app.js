@@ -92,6 +92,7 @@ export function createApp(options = {}) {
   const conversationByPair = new Map(); // "a:b" (sorted) -> conversation id
   const connections = new Map(); // phone -> Set of open WebSocket connections
   const images = new Map(); // id -> { id, mimeType, size, width, height, uploader, createdAt, bytes, thumbnail }
+  let nextSeq = 1; // Monotonic, server-assigned send order across all messages
 
   /** Returns the authenticated phone (JWT `sub`) or null after replying 401. */
   function requireAuth(req, res) {
@@ -208,6 +209,31 @@ export function createApp(options = {}) {
     }
   }
 
+  /**
+   * Pushes the messages `phone` missed while offline to a freshly (re)connected
+   * socket, ordered by the monotonic `seq` so they always arrive in send order
+   * even when several share the same `createdAt` (ZALO-10).
+   */
+  function deliverMissed(phone, conn) {
+    for (const conversation of conversations.values()) {
+      if (!conversation.participants.includes(phone)) continue;
+      const missed = (conversation.messages ?? [])
+        .filter((m) => m.sender !== phone && !m.deliveredTo.includes(phone))
+        .sort((a, b) => a.seq - b.seq);
+      for (const message of missed) {
+        message.deliveredTo.push(phone);
+        recomputeStatus(message);
+        conn.sendText(
+          JSON.stringify({
+            type: "message",
+            message: messageView(conversation, message),
+          }),
+        );
+        pushStatus(message.sender, conversation, message);
+      }
+    }
+  }
+
   /** Marks a message as read by `phone` and notifies the sender. */
   function handleRead(phone, conn, parsed) {
     const { conversationId, messageId } = parsed;
@@ -267,6 +293,7 @@ export function createApp(options = {}) {
       }
       message = {
         id: randomUUID(),
+        seq: nextSeq++,
         conversationId,
         sender: phone,
         kind: "text",
@@ -281,6 +308,7 @@ export function createApp(options = {}) {
       if (!image) return sendWsError(conn, "image not found");
       message = {
         id: randomUUID(),
+        seq: nextSeq++,
         conversationId,
         sender: phone,
         kind: "image",
@@ -539,7 +567,11 @@ export function createApp(options = {}) {
             limit = Math.min(limit, 100);
           }
           const before = searchParams.get("before");
-          const messages = conversation.messages ?? [];
+          // Order by the monotonic sequence number so history is stable even
+          // when several messages share the same `createdAt` (ZALO-10).
+          const messages = [...(conversation.messages ?? [])].sort(
+            (a, b) => a.seq - b.seq,
+          );
           let end = messages.length;
           if (before) {
             const idx = messages.findIndex((m) => m.id === before);
@@ -794,6 +826,10 @@ export function createApp(options = {}) {
           "Connection: Upgrade\r\n" +
           `Sec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`,
       );
+
+      // Deliver anything this user missed while offline, in send order, so a
+      // reconnect never shows messages shuffled (ZALO-10).
+      deliverMissed(phone, conn);
 
       if (head && head.length > 0) conn.feed(head);
     } catch {
