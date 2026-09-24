@@ -10,3 +10,9 @@ Branches and commits reference the Jira key, e.g. `ZALO-2`.
 ```sh
 npm start          # http://localhost:3000/health
 ```
+
+## Test
+
+```sh
+npm test           # node's built-in test runner; CI runs the same on every push and PR
+```
