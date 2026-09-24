@@ -133,14 +133,72 @@ export function createApp(options = {}) {
     conn.sendText(JSON.stringify({ type: "error", error }));
   }
 
-  function deliver(conversation, message) {
-    const payload = JSON.stringify({ type: "message", message });
+  /** The wire representation of a message, with the read count for groups. */
+  function messageView(conversation, message) {
+    const view = { ...message };
+    if (conversation.type === "group") {
+      view.readCount = message.readBy.length;
+    }
+    return view;
+  }
+
+  /** Phones (other than the sender) that have an open socket right now. */
+  function onlineRecipients(conversation, sender) {
+    const list = [];
     for (const participant of conversation.participants) {
-      if (participant === message.sender) continue;
+      if (participant === sender) continue;
+      if ((connections.get(participant)?.size ?? 0) > 0) list.push(participant);
+    }
+    return list;
+  }
+
+  /** Derives the aggregate status (sent/delivered/read) from receipt state. */
+  function recomputeStatus(message) {
+    if (message.readBy.length > 0) message.status = "read";
+    else if (message.deliveredTo.length > 0) message.status = "delivered";
+    else message.status = "sent";
+  }
+
+  /** Pushes a message's current status to its sender over the socket. */
+  function pushStatus(phone, conversation, message) {
+    const set = connections.get(phone);
+    if (!set || set.size === 0) return;
+    const payload = JSON.stringify({
+      type: "status",
+      message: messageView(conversation, message),
+    });
+    for (const conn of [...set]) conn.sendText(payload);
+  }
+
+  function deliver(conversation, message) {
+    const payload = JSON.stringify({
+      type: "message",
+      message: messageView(conversation, message),
+    });
+    for (const participant of message.deliveredTo) {
       const set = connections.get(participant);
-      if (!set) continue;
+      if (!set || set.size === 0) continue;
       for (const conn of [...set]) conn.sendText(payload);
     }
+  }
+
+  /** Marks a message as read by `phone` and notifies the sender. */
+  function handleRead(phone, conn, parsed) {
+    const { conversationId, messageId } = parsed;
+    const conversation = conversations.get(conversationId);
+    if (!conversation) return sendWsError(conn, "conversation not found");
+    if (!conversation.participants.includes(phone)) {
+      return sendWsError(conn, "not a participant");
+    }
+    const message = (conversation.messages ?? []).find((m) => m.id === messageId);
+    if (!message) return sendWsError(conn, "message not found");
+    if (message.sender === phone) {
+      return sendWsError(conn, "cannot read your own message");
+    }
+    if (message.readBy.includes(phone)) return; // re-reading is a no-op
+    message.readBy.push(phone);
+    recomputeStatus(message);
+    pushStatus(message.sender, conversation, message);
   }
 
   function handleWsMessage(phone, conn, raw) {
@@ -150,7 +208,11 @@ export function createApp(options = {}) {
     } catch {
       return sendWsError(conn, "invalid JSON");
     }
-    if (!parsed || parsed.type !== "send") {
+    if (!parsed || typeof parsed !== "object") {
+      return sendWsError(conn, "unsupported message type");
+    }
+    if (parsed.type === "read") return handleRead(phone, conn, parsed);
+    if (parsed.type !== "send") {
       return sendWsError(conn, "unsupported message type");
     }
 
@@ -179,9 +241,19 @@ export function createApp(options = {}) {
       sender: phone,
       text,
       createdAt: now(),
+      status: "sent",
+      deliveredTo: [],
+      readBy: [],
     };
     if (!conversation.messages) conversation.messages = [];
     conversation.messages.push(message);
+
+    // Acknowledge the initial "sent" state, then report "delivered" and
+    // push the message to whatever recipients are online right now.
+    pushStatus(phone, conversation, message);
+    message.deliveredTo = onlineRecipients(conversation, phone);
+    recomputeStatus(message);
+    if (message.status !== "sent") pushStatus(phone, conversation, message);
     deliver(conversation, message);
   }
 
@@ -421,7 +493,10 @@ export function createApp(options = {}) {
             }
             end = idx;
           }
-          const page = messages.slice(Math.max(0, end - limit), end).reverse();
+          const page = messages
+            .slice(Math.max(0, end - limit), end)
+            .reverse()
+            .map((m) => messageView(conversation, m));
           return json(res, 200, {
             messages: page,
             hasMore: end - limit > 0,
