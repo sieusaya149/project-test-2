@@ -13,6 +13,8 @@ const DEFAULT_JWT_SECRET = "zalo-dev-secret-change-me";
 const PHONE_RE = /^\+?\d{9,15}$/;
 const CODE_RE = /^\d{6}$/;
 const MAX_MESSAGE_LENGTH = 4000;
+const MIN_GROUP_MEMBERS = 2;
+const MAX_GROUP_MEMBERS = 100;
 
 function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -158,9 +160,11 @@ export function createApp(options = {}) {
     if (!conversation.participants.includes(phone)) {
       return sendWsError(conn, "not a participant");
     }
-    const recipient = conversation.participants.find((p) => p !== phone);
-    if (!isFriend(phone, recipient)) {
-      return sendWsError(conn, "can only message friends");
+    if (conversation.type !== "group") {
+      const recipient = conversation.participants.find((p) => p !== phone);
+      if (!isFriend(phone, recipient)) {
+        return sendWsError(conn, "can only message friends");
+      }
     }
     if (typeof text !== "string" || text.trim() === "") {
       return sendWsError(conn, "text must be a non-empty string");
@@ -374,6 +378,7 @@ export function createApp(options = {}) {
         }
         const conversation = {
           id: randomUUID(),
+          type: "direct",
           participants: [me, phone],
           createdAt: now(),
           messages: [],
@@ -423,6 +428,116 @@ export function createApp(options = {}) {
             nextCursor: page.length > 0 ? page[page.length - 1].id : null,
           });
         }
+      }
+
+      // ---- Group chat (ZALO-6) ----
+
+      if (method === "POST" && pathname === "/groups") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const body = await readJson(req);
+        if (body === null) return json(res, 400, { error: "invalid JSON body" });
+        const { name, members } = body;
+        if (typeof name !== "string" || name.trim() === "") {
+          return json(res, 400, { error: "group name is required" });
+        }
+        if (
+          !Array.isArray(members) ||
+          members.some((member) => !isValidPhone(member))
+        ) {
+          return json(res, 400, { error: "members must be an array of phone numbers" });
+        }
+        if (new Set(members).size !== members.length) {
+          return json(res, 400, { error: "members must be unique" });
+        }
+        if (members.includes(me)) {
+          return json(res, 400, { error: "the creator is already a member" });
+        }
+        const total = members.length + 1;
+        if (total < MIN_GROUP_MEMBERS || total > MAX_GROUP_MEMBERS) {
+          return json(res, 400, { error: "a group must have between 2 and 100 members" });
+        }
+        for (const phone of members) {
+          if (!accounts.has(phone)) {
+            return json(res, 404, { error: "user not found" });
+          }
+          if (!isFriend(me, phone)) {
+            return json(res, 403, { error: "members must be friends" });
+          }
+        }
+        const group = {
+          id: randomUUID(),
+          type: "group",
+          name,
+          admin: me,
+          participants: [me, ...members],
+          createdAt: now(),
+          messages: [],
+        };
+        conversations.set(group.id, group);
+        return json(res, 201, group);
+      }
+
+      if (method === "POST" && /^\/groups\/[^/]+\/members$/.test(pathname)) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const segments = pathname.split("/").filter(Boolean);
+        const group = conversations.get(segments[1]);
+        if (!group || group.type !== "group") {
+          return json(res, 404, { error: "group not found" });
+        }
+        if (group.admin !== me) {
+          return json(res, 403, { error: "only the group admin can add members" });
+        }
+        const body = await readJson(req);
+        if (body === null) return json(res, 400, { error: "invalid JSON body" });
+        const phone = body.phone;
+        if (!isValidPhone(phone)) {
+          return json(res, 400, { error: "invalid phone number" });
+        }
+        if (group.participants.includes(phone)) {
+          return json(res, 409, { error: "already a member" });
+        }
+        if (!accounts.has(phone)) {
+          return json(res, 404, { error: "user not found" });
+        }
+        if (group.participants.length >= MAX_GROUP_MEMBERS) {
+          return json(res, 400, { error: "group is full" });
+        }
+        if (!isFriend(me, phone)) {
+          return json(res, 403, { error: "can only add friends" });
+        }
+        group.participants.push(phone);
+        return json(res, 200, group);
+      }
+
+      if (
+        method === "DELETE" &&
+        /^\/groups\/[^/]+\/members\/[^/]+$/.test(pathname)
+      ) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const segments = pathname.split("/").filter(Boolean);
+        const group = conversations.get(segments[1]);
+        if (!group || group.type !== "group") {
+          return json(res, 404, { error: "group not found" });
+        }
+        if (group.admin !== me) {
+          return json(res, 403, { error: "only the group admin can remove members" });
+        }
+        const phone = segments[3];
+        if (phone === me) {
+          return json(res, 400, { error: "the admin cannot remove themselves" });
+        }
+        const index = group.participants.indexOf(phone);
+        if (index === -1) {
+          return json(res, 404, { error: "member not found" });
+        }
+        if (group.participants.length <= MIN_GROUP_MEMBERS) {
+          return json(res, 400, { error: "a group must have at least 2 members" });
+        }
+        group.participants.splice(index, 1);
+        return json(res, 200, group);
       }
 
       return json(res, 404, { error: "not found" });
