@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
-import { randomInt, timingSafeEqual } from "node:crypto";
-import { signJwt } from "./jwt.js";
+import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
+import { signJwt, verifyJwt } from "./jwt.js";
 
 const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -57,6 +57,55 @@ export function createApp(options = {}) {
   const otps = new Map(); // phone -> { code, expiresAt }
   const accounts = new Map(); // phone -> { phone, createdAt }
   const lockout = new Map(); // phone -> { attempts, lockedUntil }
+  const friendRequests = new Map(); // id -> { id, from, to, status, createdAt }
+  const friends = new Map(); // phone -> Set of friend phones
+  const conversations = new Map(); // id -> { id, participants, createdAt }
+  const conversationByPair = new Map(); // "a:b" (sorted) -> conversation id
+
+  /** Returns the authenticated phone (JWT `sub`) or null after replying 401. */
+  function requireAuth(req, res) {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    const payload = verifyJwt(token, jwtSecret);
+    if (
+      !payload ||
+      typeof payload.sub !== "string" ||
+      !isValidPhone(payload.sub) ||
+      (typeof payload.exp === "number" && payload.exp <= Math.floor(now() / 1000))
+    ) {
+      json(res, 401, { error: "unauthorized" });
+      return null;
+    }
+    return payload.sub;
+  }
+
+  function isFriend(a, b) {
+    return friends.get(a)?.has(b) === true;
+  }
+
+  function addFriendship(a, b) {
+    if (!friends.has(a)) friends.set(a, new Set());
+    if (!friends.has(b)) friends.set(b, new Set());
+    friends.get(a).add(b);
+    friends.get(b).add(a);
+  }
+
+  function pendingRequestBetween(a, b) {
+    for (const request of friendRequests.values()) {
+      if (
+        request.status === "pending" &&
+        ((request.from === a && request.to === b) ||
+          (request.from === b && request.to === a))
+      ) {
+        return request;
+      }
+    }
+    return null;
+  }
+
+  function pairKey(a, b) {
+    return a < b ? `${a}:${b}` : `${b}:${a}`;
+  }
 
   return createServer(async (req, res) => {
     try {
@@ -135,6 +184,128 @@ export function createApp(options = {}) {
           jwtSecret,
         );
         return json(res, 200, { token, phone });
+      }
+
+      // ---- Friends & 1-1 chat (ZALO-3) ----
+
+      if (method === "GET" && pathname === "/users/lookup") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const { searchParams } = new URL(req.url, "http://localhost");
+        const phone = searchParams.get("phone");
+        if (!isValidPhone(phone)) {
+          return json(res, 400, { error: "invalid phone number" });
+        }
+        const account = accounts.get(phone);
+        if (!account) return json(res, 404, { error: "user not found" });
+        return json(res, 200, { phone: account.phone, createdAt: account.createdAt });
+      }
+
+      if (method === "GET" && pathname === "/friends/requests") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const requests = [];
+        for (const request of friendRequests.values()) {
+          if (request.to === me && request.status === "pending") {
+            requests.push(request);
+          }
+        }
+        return json(res, 200, { requests });
+      }
+
+      if (method === "POST" && pathname === "/friends/requests") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const body = await readJson(req);
+        if (body === null) return json(res, 400, { error: "invalid JSON body" });
+        const phone = body.phone;
+        if (!isValidPhone(phone)) {
+          return json(res, 400, { error: "invalid phone number" });
+        }
+        if (phone === me) {
+          return json(res, 400, { error: "cannot send a friend request to yourself" });
+        }
+        if (!accounts.has(phone)) {
+          return json(res, 404, { error: "user not found" });
+        }
+        if (isFriend(me, phone)) {
+          return json(res, 400, { error: "already friends" });
+        }
+        if (pendingRequestBetween(me, phone)) {
+          return json(res, 409, { error: "friend request already pending" });
+        }
+        const request = {
+          id: randomUUID(),
+          from: me,
+          to: phone,
+          status: "pending",
+          createdAt: now(),
+        };
+        friendRequests.set(request.id, request);
+        return json(res, 201, request);
+      }
+
+      if (
+        method === "POST" &&
+        pathname.startsWith("/friends/requests/")
+      ) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const segments = pathname.split("/").filter(Boolean);
+        if (segments.length !== 4) return json(res, 404, { error: "not found" });
+        const id = segments[2];
+        const action = segments[3];
+        const request = friendRequests.get(id);
+        if (!request) return json(res, 404, { error: "friend request not found" });
+        if (request.to !== me) {
+          return json(res, 403, { error: "this request is not addressed to you" });
+        }
+        if (request.status !== "pending") {
+          return json(res, 409, { error: "friend request already handled" });
+        }
+        if (action === "accept") {
+          request.status = "accepted";
+          addFriendship(request.from, request.to);
+          return json(res, 200, request);
+        }
+        if (action === "decline") {
+          request.status = "declined";
+          return json(res, 200, request);
+        }
+        return json(res, 404, { error: "not found" });
+      }
+
+      if (method === "POST" && pathname === "/conversations") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const body = await readJson(req);
+        if (body === null) return json(res, 400, { error: "invalid JSON body" });
+        const phone = body.phone;
+        if (!isValidPhone(phone)) {
+          return json(res, 400, { error: "invalid phone number" });
+        }
+        if (phone === me) {
+          return json(res, 400, { error: "cannot chat with yourself" });
+        }
+        if (!accounts.has(phone)) {
+          return json(res, 404, { error: "user not found" });
+        }
+        if (!isFriend(me, phone)) {
+          return json(res, 403, { error: "can only start a chat with friends" });
+        }
+        const key = pairKey(me, phone);
+        const existingId = conversationByPair.get(key);
+        if (existingId) {
+          return json(res, 200, conversations.get(existingId));
+        }
+        const conversation = {
+          id: randomUUID(),
+          participants: [me, phone],
+          createdAt: now(),
+        };
+        conversations.set(conversation.id, conversation);
+        conversationByPair.set(key, conversation.id);
+        return json(res, 201, conversation);
       }
 
       return json(res, 404, { error: "not found" });
