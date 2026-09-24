@@ -2,6 +2,14 @@ import { createServer } from "node:http";
 import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { signJwt, verifyJwt } from "./jwt.js";
 import { computeAccept, WebSocketConnection } from "./websocket.js";
+import {
+  ALLOWED_IMAGE_TYPES,
+  MAX_IMAGE_BYTES,
+  imageDimensions,
+  makeThumbnail,
+  normalizeMimeType,
+  sniffImageMime,
+} from "./images.js";
 
 const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -21,6 +29,16 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+/** Writes a raw binary body (used for serving image bytes). */
+function sendBytes(res, status, buffer, contentType) {
+  res.writeHead(status, {
+    "content-type": contentType,
+    "content-length": String(buffer.length),
+    "cache-control": "public, max-age=31536000, immutable",
+  });
+  res.end(buffer);
+}
+
 /** Reads and parses a JSON request body; returns null when it is not valid JSON. */
 async function readJson(req) {
   const chunks = [];
@@ -32,6 +50,13 @@ async function readJson(req) {
   } catch {
     return null;
   }
+}
+
+/** Reads a raw (binary) request body into a Buffer. */
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
 }
 
 function isValidPhone(phone) {
@@ -66,6 +91,7 @@ export function createApp(options = {}) {
   const conversations = new Map(); // id -> { id, participants, createdAt }
   const conversationByPair = new Map(); // "a:b" (sorted) -> conversation id
   const connections = new Map(); // phone -> Set of open WebSocket connections
+  const images = new Map(); // id -> { id, mimeType, size, width, height, uploader, createdAt, bytes, thumbnail }
 
   /** Returns the authenticated phone (JWT `sub`) or null after replying 401. */
   function requireAuth(req, res) {
@@ -212,11 +238,12 @@ export function createApp(options = {}) {
       return sendWsError(conn, "unsupported message type");
     }
     if (parsed.type === "read") return handleRead(phone, conn, parsed);
-    if (parsed.type !== "send") {
-      return sendWsError(conn, "unsupported message type");
-    }
 
-    const { conversationId, text } = parsed;
+    const kind =
+      parsed.type === "send" ? "text" : parsed.type === "image" ? "image" : null;
+    if (!kind) return sendWsError(conn, "unsupported message type");
+
+    const { conversationId } = parsed;
     const conversation = conversations.get(conversationId);
     if (!conversation) return sendWsError(conn, "conversation not found");
     if (!conversation.participants.includes(phone)) {
@@ -228,23 +255,51 @@ export function createApp(options = {}) {
         return sendWsError(conn, "can only message friends");
       }
     }
-    if (typeof text !== "string" || text.trim() === "") {
-      return sendWsError(conn, "text must be a non-empty string");
-    }
-    if (text.length > MAX_MESSAGE_LENGTH) {
-      return sendWsError(conn, "text too long");
+
+    let message;
+    if (kind === "text") {
+      const { text } = parsed;
+      if (typeof text !== "string" || text.trim() === "") {
+        return sendWsError(conn, "text must be a non-empty string");
+      }
+      if (text.length > MAX_MESSAGE_LENGTH) {
+        return sendWsError(conn, "text too long");
+      }
+      message = {
+        id: randomUUID(),
+        conversationId,
+        sender: phone,
+        kind: "text",
+        text,
+        createdAt: now(),
+        status: "sent",
+        deliveredTo: [],
+        readBy: [],
+      };
+    } else {
+      const image = images.get(parsed.imageId);
+      if (!image) return sendWsError(conn, "image not found");
+      message = {
+        id: randomUUID(),
+        conversationId,
+        sender: phone,
+        kind: "image",
+        image: {
+          id: image.id,
+          url: `/images/${image.id}`,
+          thumbnailUrl: `/images/${image.id}/thumbnail`,
+          mimeType: image.mimeType,
+          size: image.size,
+          width: image.width,
+          height: image.height,
+        },
+        createdAt: now(),
+        status: "sent",
+        deliveredTo: [],
+        readBy: [],
+      };
     }
 
-    const message = {
-      id: randomUUID(),
-      conversationId,
-      sender: phone,
-      text,
-      createdAt: now(),
-      status: "sent",
-      deliveredTo: [],
-      readBy: [],
-    };
     if (!conversation.messages) conversation.messages = [];
     conversation.messages.push(message);
 
@@ -613,6 +668,79 @@ export function createApp(options = {}) {
         }
         group.participants.splice(index, 1);
         return json(res, 200, group);
+      }
+
+      // ---- Images (ZALO-9) ----
+
+      if (method === "POST" && pathname === "/images") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+
+        const mimeType = normalizeMimeType(req.headers["content-type"]);
+        if (!mimeType) {
+          return json(res, 415, {
+            error: `unsupported image type; allowed types: ${[...ALLOWED_IMAGE_TYPES.keys()].join(", ")}`,
+          });
+        }
+
+        const body = await readBody(req);
+        if (body.length === 0) {
+          return json(res, 400, { error: "image body is empty" });
+        }
+        if (body.length > MAX_IMAGE_BYTES) {
+          return json(res, 413, {
+            error: "image exceeds the 20 MB limit",
+          });
+        }
+        const sniffed = sniffImageMime(body);
+        if (sniffed !== mimeType) {
+          return json(res, 415, {
+            error: "image bytes do not match the declared content type",
+          });
+        }
+
+        const id = randomUUID();
+        const dimensions = imageDimensions(body, mimeType);
+        const thumbnail = makeThumbnail(body, mimeType);
+        images.set(id, {
+          id,
+          mimeType,
+          size: body.length,
+          width: dimensions?.width ?? null,
+          height: dimensions?.height ?? null,
+          uploader: me,
+          createdAt: now(),
+          bytes: body,
+          thumbnailBytes: thumbnail.bytes,
+          thumbnailMimeType: thumbnail.mimeType,
+        });
+        return json(res, 201, {
+          id,
+          mimeType,
+          size: body.length,
+          width: dimensions?.width ?? null,
+          height: dimensions?.height ?? null,
+          url: `/images/${id}`,
+          thumbnailUrl: `/images/${id}/thumbnail`,
+        });
+      }
+
+      if (method === "GET" && /^\/images\/[^/]+\/thumbnail$/.test(pathname)) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const id = pathname.split("/")[2];
+        const image = images.get(id);
+        if (!image) return json(res, 404, { error: "image not found" });
+        return sendBytes(res, 200, image.thumbnailBytes, image.thumbnailMimeType);
+      }
+
+      if (method === "GET" && /^\/images\/[^/]+$/.test(pathname)) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const id = pathname.split("/")[2];
+        const image = images.get(id);
+        if (!image) return json(res, 404, { error: "image not found" });
+        return sendBytes(res, 200, image.bytes, image.mimeType);
       }
 
       return json(res, 404, { error: "not found" });
