@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { signJwt, verifyJwt } from "./jwt.js";
+import { WsConnection, writeHandshake, rejectUpgrade } from "./ws.js";
 
 const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -11,6 +12,8 @@ const DEFAULT_JWT_SECRET = "zalo-dev-secret-change-me";
 // Local phone numbers (with an optional leading "+") between 9 and 15 digits.
 const PHONE_RE = /^\+?\d{9,15}$/;
 const CODE_RE = /^\d{6}$/;
+const DEFAULT_PAGE_LIMIT = 20;
+const MAX_PAGE_LIMIT = 100;
 
 function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -44,6 +47,14 @@ function codesMatch(a, b) {
   return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
 }
 
+/** Parses a pagination `limit`, clamping it to [min, max] (or the fallback). */
+function clampInt(value, min, max, fallback) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 /**
  * Builds the HTTP server. `options.now` injects a clock (ms) for tests and
  * `options.jwtSecret` overrides the signing secret.
@@ -61,11 +72,13 @@ export function createApp(options = {}) {
   const friends = new Map(); // phone -> Set of friend phones
   const conversations = new Map(); // id -> { id, participants, createdAt }
   const conversationByPair = new Map(); // "a:b" (sorted) -> conversation id
+  const messages = new Map(); // conversationId -> [{ id, conversationId, sender, text, sentAt }]
+  const connections = new Map(); // phone -> Set of live WebSocket connections
+  let messageSeq = 0; // monotonic source of message ids (also the pagination cursor)
 
-  /** Returns the authenticated phone (JWT `sub`) or null after replying 401. */
-  function requireAuth(req, res) {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  /** Validates a JWT and returns the authenticated phone (`sub`) or null. */
+  function authenticate(token) {
+    if (typeof token !== "string" || token === "") return null;
     const payload = verifyJwt(token, jwtSecret);
     if (
       !payload ||
@@ -73,10 +86,21 @@ export function createApp(options = {}) {
       !isValidPhone(payload.sub) ||
       (typeof payload.exp === "number" && payload.exp <= Math.floor(now() / 1000))
     ) {
-      json(res, 401, { error: "unauthorized" });
       return null;
     }
     return payload.sub;
+  }
+
+  /** Returns the authenticated phone (JWT `sub`) or null after replying 401. */
+  function requireAuth(req, res) {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    const phone = authenticate(token);
+    if (!phone) {
+      json(res, 401, { error: "unauthorized" });
+      return null;
+    }
+    return phone;
   }
 
   function isFriend(a, b) {
@@ -107,7 +131,66 @@ export function createApp(options = {}) {
     return a < b ? `${a}:${b}` : `${b}:${a}`;
   }
 
-  return createServer(async (req, res) => {
+  /** Pushes a JSON-serialisable payload to every live socket of a phone. */
+  function pushTo(phone, payload) {
+    const sockets = connections.get(phone);
+    if (!sockets || sockets.size === 0) return;
+    const data = JSON.stringify(payload);
+    for (const conn of sockets) conn.send(data);
+  }
+
+  /** Handles an inbound WebSocket message (already parsed text) from `sender`. */
+  function handleWsMessage(sender, conn, raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return conn.send(JSON.stringify({ type: "error", error: "invalid JSON" }));
+    }
+    if (!msg || msg.type !== "message") {
+      return conn.send(
+        JSON.stringify({ type: "error", error: "expected a message frame" }),
+      );
+    }
+    const { conversationId, text } = msg;
+    if (typeof text !== "string" || text.length === 0) {
+      return conn.send(JSON.stringify({ type: "error", error: "invalid text" }));
+    }
+    const conversation = conversations.get(conversationId);
+    if (!conversation) {
+      return conn.send(
+        JSON.stringify({ type: "error", error: "conversation not found" }),
+      );
+    }
+    if (!conversation.participants.includes(sender)) {
+      return conn.send(
+        JSON.stringify({ type: "error", error: "not a participant" }),
+      );
+    }
+    // Only friends may chat: re-assert the invariant at send time.
+    const [a, b] = conversation.participants;
+    if (!isFriend(a, b)) {
+      return conn.send(JSON.stringify({ type: "error", error: "not friends" }));
+    }
+
+    const message = {
+      id: String(++messageSeq),
+      conversationId,
+      sender,
+      text,
+      sentAt: now(),
+    };
+    const list = messages.get(conversationId) ?? [];
+    list.push(message);
+    messages.set(conversationId, list);
+
+    const payload = { type: "message", message };
+    const recipient = a === sender ? b : a;
+    pushTo(sender, payload); // echo back so the sender gets the canonical record
+    pushTo(recipient, payload); // realtime push to the online recipient
+  }
+
+  const server = createServer(async (req, res) => {
     try {
       const { pathname } = new URL(req.url, "http://localhost");
       const method = req.method;
@@ -308,10 +391,86 @@ export function createApp(options = {}) {
         return json(res, 201, conversation);
       }
 
+      // ---- Realtime 1-1 messaging (ZALO-5) ----
+
+      const messagesMatch = pathname.match(/^\/conversations\/([^/]+)\/messages$/);
+      if (method === "GET" && messagesMatch) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        const conversationId = messagesMatch[1];
+        const conversation = conversations.get(conversationId);
+        if (!conversation) {
+          return json(res, 404, { error: "conversation not found" });
+        }
+        if (!conversation.participants.includes(me)) {
+          return json(res, 403, { error: "not a participant" });
+        }
+        const { searchParams } = new URL(req.url, "http://localhost");
+        const limit = clampInt(
+          searchParams.get("limit"),
+          1,
+          MAX_PAGE_LIMIT,
+          DEFAULT_PAGE_LIMIT,
+        );
+        const before = searchParams.get("before");
+        const list = messages.get(conversationId) ?? [];
+        let window = list;
+        if (before !== null && before !== undefined) {
+          const index = list.findIndex((m) => m.id === before);
+          if (index === -1) return json(res, 404, { error: "unknown cursor" });
+          window = list.slice(0, index);
+        }
+        const page = window.slice(-limit);
+        const hasMore = window.length > page.length;
+        return json(res, 200, {
+          conversationId,
+          messages: page,
+          hasMore,
+          nextCursor: hasMore ? page[0].id : null,
+        });
+      }
+
       return json(res, 404, { error: "not found" });
     } catch {
       if (!res.headersSent) json(res, 500, { error: "internal server error" });
       else res.end();
     }
   });
+
+  server.on("upgrade", (req, socket, head) => {
+    try {
+      const url = new URL(req.url, "http://localhost");
+      if (url.pathname !== "/ws") {
+        return rejectUpgrade(socket, 404, "Not Found");
+      }
+      const key = req.headers["sec-websocket-key"];
+      if (
+        (req.headers.upgrade ?? "").toLowerCase() !== "websocket" ||
+        typeof key !== "string"
+      ) {
+        return rejectUpgrade(socket, 400, "Bad Request");
+      }
+      const user = authenticate(url.searchParams.get("token"));
+      if (!user) {
+        return rejectUpgrade(socket, 401, "Unauthorized");
+      }
+      writeHandshake(socket, key);
+      const conn = new WsConnection(socket, head);
+      let sockets = connections.get(user);
+      if (!sockets) connections.set(user, (sockets = new Set()));
+      sockets.add(conn);
+      conn.onmessage = (raw) => handleWsMessage(user, conn, raw);
+      conn.onclose = () => {
+        const set = connections.get(user);
+        if (set) {
+          set.delete(conn);
+          if (set.size === 0) connections.delete(user);
+        }
+      };
+    } catch {
+      rejectUpgrade(socket, 500, "Internal Server Error");
+    }
+  });
+
+  return server;
 }
