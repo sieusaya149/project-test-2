@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { signJwt, verifyJwt } from "./jwt.js";
+import { computeAccept, WebSocketConnection } from "./websocket.js";
 
 const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const LOCK_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -11,6 +12,7 @@ const DEFAULT_JWT_SECRET = "zalo-dev-secret-change-me";
 // Local phone numbers (with an optional leading "+") between 9 and 15 digits.
 const PHONE_RE = /^\+?\d{9,15}$/;
 const CODE_RE = /^\d{6}$/;
+const MAX_MESSAGE_LENGTH = 4000;
 
 function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
@@ -61,6 +63,7 @@ export function createApp(options = {}) {
   const friends = new Map(); // phone -> Set of friend phones
   const conversations = new Map(); // id -> { id, participants, createdAt }
   const conversationByPair = new Map(); // "a:b" (sorted) -> conversation id
+  const connections = new Map(); // phone -> Set of open WebSocket connections
 
   /** Returns the authenticated phone (JWT `sub`) or null after replying 401. */
   function requireAuth(req, res) {
@@ -107,7 +110,78 @@ export function createApp(options = {}) {
     return a < b ? `${a}:${b}` : `${b}:${a}`;
   }
 
-  return createServer(async (req, res) => {
+  function rejectUpgrade(socket, status) {
+    const reason =
+      status === 401
+        ? "Unauthorized"
+        : status === 404
+          ? "Not Found"
+          : "Bad Request";
+    try {
+      socket.write(
+        `HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+      );
+      socket.destroy();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function sendWsError(conn, error) {
+    conn.sendText(JSON.stringify({ type: "error", error }));
+  }
+
+  function deliver(conversation, message) {
+    const payload = JSON.stringify({ type: "message", message });
+    for (const participant of conversation.participants) {
+      if (participant === message.sender) continue;
+      const set = connections.get(participant);
+      if (!set) continue;
+      for (const conn of [...set]) conn.sendText(payload);
+    }
+  }
+
+  function handleWsMessage(phone, conn, raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return sendWsError(conn, "invalid JSON");
+    }
+    if (!parsed || parsed.type !== "send") {
+      return sendWsError(conn, "unsupported message type");
+    }
+
+    const { conversationId, text } = parsed;
+    const conversation = conversations.get(conversationId);
+    if (!conversation) return sendWsError(conn, "conversation not found");
+    if (!conversation.participants.includes(phone)) {
+      return sendWsError(conn, "not a participant");
+    }
+    const recipient = conversation.participants.find((p) => p !== phone);
+    if (!isFriend(phone, recipient)) {
+      return sendWsError(conn, "can only message friends");
+    }
+    if (typeof text !== "string" || text.trim() === "") {
+      return sendWsError(conn, "text must be a non-empty string");
+    }
+    if (text.length > MAX_MESSAGE_LENGTH) {
+      return sendWsError(conn, "text too long");
+    }
+
+    const message = {
+      id: randomUUID(),
+      conversationId,
+      sender: phone,
+      text,
+      createdAt: now(),
+    };
+    if (!conversation.messages) conversation.messages = [];
+    conversation.messages.push(message);
+    deliver(conversation, message);
+  }
+
+  const server = createServer(async (req, res) => {
     try {
       const { pathname } = new URL(req.url, "http://localhost");
       const method = req.method;
@@ -302,10 +376,53 @@ export function createApp(options = {}) {
           id: randomUUID(),
           participants: [me, phone],
           createdAt: now(),
+          messages: [],
         };
         conversations.set(conversation.id, conversation);
         conversationByPair.set(key, conversation.id);
         return json(res, 201, conversation);
+      }
+
+      if (method === "GET" && pathname.startsWith("/conversations/")) {
+        const match = pathname.match(/^\/conversations\/([^/]+)\/messages$/);
+        if (match) {
+          const me = requireAuth(req, res);
+          if (!me) return;
+          const conversation = conversations.get(match[1]);
+          if (!conversation) {
+            return json(res, 404, { error: "conversation not found" });
+          }
+          if (!conversation.participants.includes(me)) {
+            return json(res, 403, { error: "not a participant" });
+          }
+
+          const { searchParams } = new URL(req.url, "http://localhost");
+          let limit = 50;
+          const limitRaw = searchParams.get("limit");
+          if (limitRaw !== null) {
+            limit = Number.parseInt(limitRaw, 10);
+            if (!Number.isInteger(limit) || limit < 1) {
+              return json(res, 400, { error: "invalid limit" });
+            }
+            limit = Math.min(limit, 100);
+          }
+          const before = searchParams.get("before");
+          const messages = conversation.messages ?? [];
+          let end = messages.length;
+          if (before) {
+            const idx = messages.findIndex((m) => m.id === before);
+            if (idx === -1) {
+              return json(res, 404, { error: "message not found" });
+            }
+            end = idx;
+          }
+          const page = messages.slice(Math.max(0, end - limit), end).reverse();
+          return json(res, 200, {
+            messages: page,
+            hasMore: end - limit > 0,
+            nextCursor: page.length > 0 ? page[page.length - 1].id : null,
+          });
+        }
       }
 
       return json(res, 404, { error: "not found" });
@@ -314,4 +431,61 @@ export function createApp(options = {}) {
       else res.end();
     }
   });
+
+  server.on("upgrade", (req, socket, head) => {
+    try {
+      const { pathname, searchParams } = new URL(req.url, "http://localhost");
+      if (pathname !== "/ws") return rejectUpgrade(socket, 404);
+
+      const token = searchParams.get("token") ?? "";
+      const payload = verifyJwt(token, jwtSecret);
+      const phone =
+        payload &&
+        typeof payload.sub === "string" &&
+        isValidPhone(payload.sub) &&
+        !(
+          typeof payload.exp === "number" &&
+          payload.exp <= Math.floor(now() / 1000)
+        )
+          ? payload.sub
+          : null;
+      if (!phone) return rejectUpgrade(socket, 401);
+
+      const key = req.headers["sec-websocket-key"];
+      const version = req.headers["sec-websocket-version"];
+      if (typeof key !== "string" || key.length === 0) {
+        return rejectUpgrade(socket, 400);
+      }
+      if (version !== "13") return rejectUpgrade(socket, 400);
+
+      const conn = new WebSocketConnection(socket);
+      if (!connections.has(phone)) connections.set(phone, new Set());
+      connections.get(phone).add(conn);
+
+      conn.onMessage = (raw) => handleWsMessage(phone, conn, raw);
+      conn.onClose = () => {
+        const set = connections.get(phone);
+        if (!set) return;
+        set.delete(conn);
+        if (set.size === 0) connections.delete(phone);
+      };
+
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          `Sec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`,
+      );
+
+      if (head && head.length > 0) conn.feed(head);
+    } catch {
+      try {
+        socket.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  return server;
 }
