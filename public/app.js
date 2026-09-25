@@ -18,6 +18,10 @@ for (const link of links) {
     for (const other of links) {
       other.classList.toggle("is-active", other === link);
     }
+
+    if (target === "friends") {
+      loadFriendsPage();
+    }
   });
 }
 
@@ -163,6 +167,178 @@ function showLoggedOut() {
   clearMessage();
   hideDevCode();
 }
+
+// ---- Friends page (ZALO-14) ----
+
+const friendsLoginPrompt = document.getElementById("friends-login-prompt");
+const friendsContent = document.getElementById("friends-content");
+const friendRequestForm = document.getElementById("friend-request-form");
+const friendPhoneInput = document.getElementById("friend-phone");
+const friendRequestMessage = document.getElementById("friend-request-message");
+const friendsList = document.getElementById("friends-list");
+const requestsList = document.getElementById("requests-list");
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+async function authedFetch(url, options = {}) {
+  const headers = { ...(options.headers ?? {}) };
+  headers.authorization = `Bearer ${getToken()}`;
+  const res = await fetch(url, { ...options, headers });
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    // Non-JSON body.
+  }
+  return { status: res.status, body };
+}
+
+function showFriendRequestMessage(text, isError) {
+  friendRequestMessage.textContent = text;
+  friendRequestMessage.classList.toggle("is-error", Boolean(isError));
+  friendRequestMessage.hidden = false;
+}
+
+function clearFriendRequestMessage() {
+  friendRequestMessage.textContent = "";
+  friendRequestMessage.classList.remove("is-error");
+  friendRequestMessage.hidden = true;
+}
+
+function renderFriends(friends) {
+  friendsList.innerHTML = "";
+  if (friends.length === 0) {
+    const li = document.createElement("li");
+    li.className = "list-empty";
+    li.textContent = "You have no friends yet.";
+    friendsList.appendChild(li);
+    return;
+  }
+  for (const phone of friends) {
+    const li = document.createElement("li");
+    li.className = "list-item";
+    li.textContent = phone;
+    friendsList.appendChild(li);
+  }
+}
+
+function renderRequests(requests) {
+  requestsList.innerHTML = "";
+  if (requests.length === 0) {
+    const li = document.createElement("li");
+    li.className = "list-empty";
+    li.textContent = "No incoming requests.";
+    requestsList.appendChild(li);
+    return;
+  }
+  for (const request of requests) {
+    const li = document.createElement("li");
+    li.className = "list-item request-item";
+
+    const from = document.createElement("span");
+    from.className = "request-from";
+    from.textContent = request.from;
+    li.appendChild(from);
+
+    const actions = document.createElement("div");
+    actions.className = "btn-row";
+
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.className = "btn btn-primary btn-small";
+    accept.textContent = "Accept";
+    accept.addEventListener("click", () => handleRequest(request.id, "accept"));
+    actions.appendChild(accept);
+
+    const decline = document.createElement("button");
+    decline.type = "button";
+    decline.className = "btn btn-ghost btn-small";
+    decline.textContent = "Decline";
+    decline.addEventListener("click", () => handleRequest(request.id, "decline"));
+    actions.appendChild(decline);
+
+    li.appendChild(actions);
+    requestsList.appendChild(li);
+  }
+}
+
+async function refreshFriends() {
+  const { status, body } = await authedFetch("/friends");
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) return;
+  renderFriends(body.friends ?? []);
+}
+
+async function refreshRequests() {
+  const { status, body } = await authedFetch("/friends/requests");
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) return;
+  renderRequests(body.requests ?? []);
+}
+
+function handleFriendsUnauthorized() {
+  // The stored token is no longer valid: drop the session and ask to log in.
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(PHONE_KEY);
+  showLoggedOut();
+  friendsContent.hidden = true;
+  friendsLoginPrompt.textContent = "Your session expired. Please log in again.";
+  friendsLoginPrompt.hidden = false;
+}
+
+async function loadFriendsPage() {
+  clearFriendRequestMessage();
+  if (!getToken()) {
+    friendsContent.hidden = true;
+    friendsLoginPrompt.textContent = "Log in to see your friends.";
+    friendsLoginPrompt.hidden = false;
+    return;
+  }
+  friendsLoginPrompt.hidden = true;
+  friendsContent.hidden = false;
+  await Promise.all([refreshFriends(), refreshRequests()]);
+}
+
+async function handleRequest(id, action) {
+  const { status, body } = await authedFetch(
+    `/friends/requests/${id}/${action}`,
+    { method: "POST" },
+  );
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) {
+    showFriendRequestMessage(
+      body?.error ?? `Could not ${action} the request.`,
+      true,
+    );
+    return;
+  }
+  // Accepting changes the friends list; declining removes the request.
+  await Promise.all([refreshFriends(), refreshRequests()]);
+}
+
+friendRequestForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  clearFriendRequestMessage();
+  const phone = friendPhoneInput.value.trim();
+  if (!phone) return;
+  const { status, body } = await authedFetch("/friends/requests", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ phone }),
+  });
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status === 201) {
+    friendPhoneInput.value = "";
+    showFriendRequestMessage("Friend request sent.", false);
+  } else {
+    showFriendRequestMessage(
+      body?.error ?? "Could not send the friend request.",
+      true,
+    );
+  }
+});
 
 // Restore a stored session (or start logged out) on page load.
 (function restoreSession() {

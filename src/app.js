@@ -508,6 +508,14 @@ export function createApp(options = {}) {
         return json(res, 200, { phone: account.phone, createdAt: account.createdAt });
       }
 
+      if (method === "GET" && pathname === "/friends") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+        // The caller's friends as a sorted list of phones (ZALO-14).
+        const list = [...(friends.get(me) ?? [])].sort();
+        return json(res, 200, { friends: list });
+      }
+
       if (method === "GET" && pathname === "/friends/requests") {
         const me = requireAuth(req, res);
         if (!me) return;
