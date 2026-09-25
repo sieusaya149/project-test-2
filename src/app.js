@@ -617,6 +617,46 @@ export function createApp(options = {}) {
         return json(res, 201, conversation);
       }
 
+      // The Chats page needs to list a user's conversations (ZALO-15):
+      // return the caller's own conversations (direct and group) with their
+      // latest message, ordered most recent first.
+      if (method === "GET" && pathname === "/conversations") {
+        const me = requireAuth(req, res);
+        if (!me) return;
+
+        const list = [];
+        for (const conversation of conversations.values()) {
+          if (!conversation.participants.includes(me)) continue;
+          const messages = conversation.messages ?? [];
+          let latest = null;
+          for (const message of messages) {
+            if (latest === null || message.seq > latest.seq) latest = message;
+          }
+          list.push({
+            id: conversation.id,
+            type: conversation.type,
+            name: conversation.name,
+            participants: [...conversation.participants],
+            latestMessage: latest ? messageView(conversation, latest) : null,
+            createdAt: conversation.createdAt,
+          });
+        }
+
+        // Most recent first: by the newest activity (the latest message, or the
+        // conversation's own creation time when it has no messages yet).
+        list.sort((a, b) => {
+          const aAt = a.latestMessage ? a.latestMessage.createdAt : a.createdAt;
+          const bAt = b.latestMessage ? b.latestMessage.createdAt : b.createdAt;
+          if (aAt !== bAt) return bAt - aAt;
+          const aSeq = a.latestMessage ? a.latestMessage.seq : 0;
+          const bSeq = b.latestMessage ? b.latestMessage.seq : 0;
+          if (aSeq !== bSeq) return bSeq - aSeq;
+          return b.createdAt - a.createdAt;
+        });
+
+        return json(res, 200, { conversations: list });
+      }
+
       if (method === "GET" && pathname.startsWith("/conversations/")) {
         const match = pathname.match(/^\/conversations\/([^/]+)\/messages$/);
         if (match) {
