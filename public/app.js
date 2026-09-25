@@ -256,7 +256,40 @@ function appendMessage(message) {
   }
   if (renderedMessageIds.has(message.id)) return;
   renderedMessageIds.add(message.id);
-  messageList.appendChild(renderMessageItem(message));
+  // The empty-state placeholder is replaced by the first real message.
+  for (const child of [...messageList.children]) {
+    if (child.className === "message-empty") child.remove();
+  }
+  insertMessageItem(renderMessageItem(message), message.seq);
+}
+
+/**
+ * Orders messages oldest-first by the server's monotonic `seq` and drops
+ * duplicates by id, so a reconnect never shows a message twice or out of order
+ * (ZALO-18).
+ */
+function orderMessages(messages) {
+  const byId = new Map();
+  for (const message of messages) {
+    if (!message || !message.id || byId.has(message.id)) continue;
+    byId.set(message.id, message);
+  }
+  return [...byId.values()].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+}
+
+// Inserts a rendered message in `seq` order. Live messages can arrive over the
+// socket while history is still loading — or out of order after a reconnect —
+// so we insert by sequence number instead of always appending.
+function insertMessageItem(item, seq) {
+  for (const child of messageList.children) {
+    const childSeq = Number(child.dataset?.seq);
+    if (Number.isNaN(childSeq)) continue; // skip the empty-state placeholder
+    if (seq < childSeq) {
+      messageList.insertBefore(item, child);
+      return;
+    }
+  }
+  messageList.appendChild(item);
 }
 
 function tokenHeader() {
@@ -382,6 +415,7 @@ async function openConversation(conversation) {
 function renderMessageItem(message) {
   const li = document.createElement("li");
   li.className = "message";
+  li.dataset.seq = String(message.seq ?? 0);
 
   const sender = document.createElement("span");
   sender.className = "message-sender";
@@ -404,15 +438,17 @@ function renderMessages(messages) {
   messageList.replaceChildren();
   renderedMessageIds.clear();
   revokeObjectUrls();
-  if (messages.length === 0) {
+  const ordered = orderMessages(messages);
+  if (ordered.length === 0) {
     const empty = document.createElement("li");
     empty.className = "message-empty";
     empty.textContent = "No messages yet.";
     messageList.appendChild(empty);
     return;
   }
-  // The API returns newest first; show oldest first in the thread.
-  for (const message of [...messages].reverse()) {
+  // Order by the server's monotonic `seq` (oldest first) rather than trusting
+  // the API's order, so a reconnect never shows messages shuffled (ZALO-18).
+  for (const message of ordered) {
     renderedMessageIds.add(message.id);
     messageList.appendChild(renderMessageItem(message));
   }
@@ -775,3 +811,16 @@ friendRequestForm.addEventListener("submit", async (event) => {
     showLoggedOut();
   }
 })();
+
+// Expose the message-ordering internals for the ordering test (ZALO-18); the
+// browser never uses this hook.
+globalThis.__zaloChat = {
+  appendMessage,
+  renderMessages,
+  get currentConversation() {
+    return currentConversation;
+  },
+  set currentConversation(value) {
+    currentConversation = value;
+  },
+};
