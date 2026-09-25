@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zalo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1 class="app-name">Zalo</h1>
+      <nav class="app-nav" aria-label="Primary">
+        <a href="#chats" class="nav-link is-active">Chats</a>
+        <a href="#friends" class="nav-link">Friends</a>
+        <a href="#login" class="nav-link">Log in</a>
+      </nav>
+    </header>
+
+    <main class="app-main">
+      <section id="chats" class="panel">
+        <h2>Chats</h2>
+        <p>Your conversations will appear here.</p>
+      </section>
+      <section id="friends" class="panel" hidden>
+        <h2>Friends</h2>
+        <p>Your friends list will appear here.</p>
+      </section>
+      <section id="login" class="panel" hidden>
+        <h2>Log in</h2>
+        <p>Sign in with your phone number to start chatting.</p>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

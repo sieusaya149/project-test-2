@@ -1,6 +1,8 @@
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
+import { extname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { signJwt, verifyJwt } from "./jwt.js";
 import { computeAccept, WebSocketConnection } from "./websocket.js";
 import {
@@ -31,9 +33,70 @@ const MAX_MESSAGE_LENGTH = 4000;
 const MIN_GROUP_MEMBERS = 2;
 const MAX_GROUP_MEMBERS = 100;
 
+// Static frontend shell (ZALO-12): every GET is resolved strictly inside
+// public/, so path traversal (e.g. /../package.json) can never escape it.
+const PUBLIC_DIR = resolve(fileURLToPath(new URL("../public", import.meta.url)));
+
+const STATIC_MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+};
+
+function contentTypeFor(filePath) {
+  return (
+    STATIC_MIME_TYPES[extname(filePath).toLowerCase()] ??
+    "application/octet-stream"
+  );
+}
+
 function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+/**
+ * Serves a static file under public/ for a GET request. Returns true when the
+ * request was handled (served, or refused as an escape attempt); returns false
+ * when the file simply does not exist, so the caller can answer 404.
+ */
+function servePublic(res, pathname) {
+  if (pathname === "/") pathname = "/index.html";
+
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    json(res, 404, { error: "not found" });
+    return true;
+  }
+
+  const filePath = resolve(PUBLIC_DIR, "." + decoded);
+  if (!filePath.startsWith(PUBLIC_DIR + sep)) {
+    // Path traversal: anything outside public/ is never served.
+    json(res, 404, { error: "not found" });
+    return true;
+  }
+
+  if (!existsSync(filePath) || !statSync(filePath).isFile()) return false;
+
+  const body = readFileSync(filePath);
+  res.writeHead(200, {
+    "content-type": contentTypeFor(filePath),
+    "content-length": String(body.length),
+  });
+  res.end(body);
+  return true;
 }
 
 /** Writes a raw binary body (used for serving image bytes). */
@@ -785,6 +848,10 @@ export function createApp(options = {}) {
         if (!image) return json(res, 404, { error: "image not found" });
         return sendBytes(res, 200, image.bytes, image.mimeType);
       }
+
+      // ---- Static frontend shell (ZALO-12) ----
+
+      if (method === "GET" && servePublic(res, pathname)) return;
 
       return json(res, 404, { error: "not found" });
     } catch {
