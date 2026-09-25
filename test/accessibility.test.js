@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const publicDir = fileURLToPath(new URL("../public", import.meta.url));
@@ -69,7 +70,7 @@ function imgHasAlt(imgTag) {
 
 test("every page under public/ is accessible", () => {
   for (const page of pages) {
-    const html = readFileSync(`${publicDir}/${page}`, "utf8");
+    const html = readFileSync(join(publicDir, page), "utf8");
     assert.ok(hasLang(html), `${page}: <html> must have a lang attribute`);
     assert.ok(hasTitle(html), `${page}: must have a non-empty <title>`);
     assert.ok(hasMain(html), `${page}: must have a <main> element`);
