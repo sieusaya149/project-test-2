@@ -35,6 +35,22 @@
           <ol id="message-list" class="message-list"></ol>
           <form id="message-form" class="message-form">
             <input
+              id="image-input"
+              name="image"
+              type="file"
+              accept="image/jpeg,image/png"
+              hidden
+            />
+            <button
+              type="button"
+              id="attach-button"
+              class="btn btn-ghost"
+              aria-label="Attach an image"
+              title="Attach an image"
+            >
+              📷
+            </button>
+            <input
               id="message-input"
               name="text"
               type="text"
@@ -44,6 +60,7 @@
             />
             <button type="submit" class="btn btn-primary">Send</button>
           </form>
+          <p id="image-upload-message" class="message is-error" hidden></p>
         </div>
       </section>
       <section id="friends" class="panel" hidden>
@@ -137,6 +154,18 @@
         </div>
       </section>
     </main>
+
+    <div id="image-lightbox" class="image-lightbox" hidden>
+      <button
+        type="button"
+        id="image-lightbox-close"
+        class="image-lightbox-close"
+        aria-label="Close"
+      >
+        ✕
+      </button>
+      <img id="image-lightbox-img" alt="Full-size image" />
+    </div>
 
     <script src="/app.js"></script>
   </body>
