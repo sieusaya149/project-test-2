@@ -37,7 +37,40 @@
       </section>
       <section id="friends" class="panel" hidden>
         <h2>Friends</h2>
-        <p>Your friends list will appear here.</p>
+
+        <p id="friends-login-prompt" class="field-hint" hidden>
+          Log in to see your friends.
+        </p>
+
+        <div id="friends-content" hidden>
+          <section class="friends-section">
+            <h3>Add a friend</h3>
+            <form id="friend-request-form" class="auth-form">
+              <label class="field-label" for="friend-phone">Phone number</label>
+              <input
+                id="friend-phone"
+                name="phone"
+                type="tel"
+                inputmode="tel"
+                autocomplete="tel"
+                placeholder="e.g. 0901234567"
+                required
+              />
+              <button type="submit" class="btn btn-primary">Send request</button>
+            </form>
+            <p id="friend-request-message" class="message" hidden></p>
+          </section>
+
+          <section class="friends-section">
+            <h3>My friends</h3>
+            <ul id="friends-list" class="list"></ul>
+          </section>
+
+          <section class="friends-section">
+            <h3>Incoming requests</h3>
+            <ul id="requests-list" class="list"></ul>
+          </section>
+        </div>
       </section>
       <section id="login" class="panel" hidden>
         <h2>Log in</h2>

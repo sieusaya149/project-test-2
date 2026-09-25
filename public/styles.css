@@ -273,3 +273,50 @@ body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ---- Friends page (ZALO-14) ---- */
+
+.friends-section {
+  margin-top: 24px;
+}
+
+.friends-section h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.list-empty {
+  color: var(--muted);
+  font-size: 14px;
+  padding: 8px 0;
+}
+
+.request-from {
+  font-weight: 600;
+}
+
+.btn-small {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
