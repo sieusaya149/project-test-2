@@ -27,7 +27,56 @@
       </section>
       <section id="login" class="panel" hidden>
         <h2>Log in</h2>
-        <p>Sign in with your phone number to start chatting.</p>
+
+        <div id="login-form">
+          <form id="phone-form" class="auth-form">
+            <label class="field-label" for="phone">Phone number</label>
+            <input
+              id="phone"
+              name="phone"
+              type="tel"
+              inputmode="tel"
+              autocomplete="tel"
+              placeholder="e.g. 0901234567"
+              required
+            />
+            <p class="field-hint">We'll send a 6-digit code to this number.</p>
+            <button type="submit" class="btn btn-primary">Request code</button>
+          </form>
+
+          <form id="code-form" class="auth-form" hidden>
+            <p class="field-hint">
+              Enter the 6-digit code for <strong id="code-phone"></strong>.
+            </p>
+            <label class="field-label" for="code">Verification code</label>
+            <input
+              id="code"
+              name="code"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="6"
+              placeholder="123456"
+              required
+            />
+            <div class="btn-row">
+              <button type="submit" class="btn btn-primary">Verify</button>
+              <button type="button" id="change-phone" class="btn btn-ghost">
+                Change phone
+              </button>
+            </div>
+          </form>
+
+          <p id="login-message" class="message is-error" hidden></p>
+          <p id="dev-code-hint" class="dev-hint" hidden>
+            Demo code: <strong id="dev-code-value"></strong>
+          </p>
+        </div>
+
+        <div id="logged-in-view" hidden>
+          <p class="logged-in-line">Signed in as <strong id="logged-in-phone"></strong>.</p>
+          <button type="button" id="logout" class="btn btn-ghost">Log out</button>
+        </div>
       </section>
     </main>
 
