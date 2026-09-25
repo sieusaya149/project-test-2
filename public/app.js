@@ -182,10 +182,18 @@ const messageList = document.getElementById("message-list");
 const backToChatsButton = document.getElementById("back-to-chats");
 const messageForm = document.getElementById("message-form");
 const messageInput = document.getElementById("message-input");
+const imageInput = document.getElementById("image-input");
+const attachButton = document.getElementById("attach-button");
+const imageUploadMessage = document.getElementById("image-upload-message");
+const imageLightbox = document.getElementById("image-lightbox");
+const imageLightboxImg = document.getElementById("image-lightbox-img");
+const imageLightboxClose = document.getElementById("image-lightbox-close");
 
 let currentConversation = null;
 let socket = null;
 const renderedMessageIds = new Set();
+// Blob URLs created for image thumbnails/full-size views (ZALO-17).
+const activeObjectUrls = new Set();
 
 // Opens (or reuses) one WebSocket per logged-in session so this tab receives
 // live messages without reloading. `socket` keeps the current connection.
@@ -289,6 +297,8 @@ function showChatsLoggedOut() {
   conversationList.replaceChildren();
   messageList.replaceChildren();
   renderedMessageIds.clear();
+  revokeObjectUrls();
+  clearImageMessage();
 }
 
 async function loadConversations() {
@@ -363,6 +373,7 @@ async function openConversation(conversation) {
   chatsListView.hidden = true;
   chatView.hidden = false;
   messageInput.value = "";
+  clearImageMessage();
   renderMessages(body.messages ?? []);
   connectSocket();
   messageInput.focus();
@@ -378,7 +389,12 @@ function renderMessageItem(message) {
 
   const content = document.createElement("span");
   content.className = "message-content";
-  content.textContent = message.kind === "image" ? "📷 Photo" : message.text;
+  if (message.kind === "image") {
+    // Show a thumbnail that opens the full-size image on click (ZALO-17).
+    content.appendChild(renderImageThumb(message.image));
+  } else {
+    content.textContent = message.text;
+  }
 
   li.append(sender, content);
   return li;
@@ -387,6 +403,7 @@ function renderMessageItem(message) {
 function renderMessages(messages) {
   messageList.replaceChildren();
   renderedMessageIds.clear();
+  revokeObjectUrls();
   if (messages.length === 0) {
     const empty = document.createElement("li");
     empty.className = "message-empty";
@@ -400,6 +417,158 @@ function renderMessages(messages) {
     messageList.appendChild(renderMessageItem(message));
   }
 }
+
+// ---- Send images in the chat (ZALO-17) ----
+
+// Only JPEG and PNG may be attached; the page rejects anything else before it
+// ever reaches the upload endpoint.
+const ATTACHABLE_IMAGE_TYPES = new Set(["image/jpeg", "image/png"]);
+
+function imageMimeType(file) {
+  if (ATTACHABLE_IMAGE_TYPES.has(file.type)) return file.type;
+  // Some browsers leave `type` empty; fall back to the file extension so a
+  // correctly named image still uploads.
+  const name = file.name.toLowerCase();
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  if (name.endsWith(".png")) return "image/png";
+  return null;
+}
+
+function showImageMessage(text, isError) {
+  imageUploadMessage.textContent = text;
+  imageUploadMessage.classList.toggle("is-error", Boolean(isError));
+  imageUploadMessage.hidden = false;
+}
+
+function clearImageMessage() {
+  imageUploadMessage.textContent = "";
+  imageUploadMessage.classList.remove("is-error");
+  imageUploadMessage.hidden = true;
+}
+
+// Image bytes require the JWT, so they are fetched as blobs and shown through
+// object URLs (a plain <img src> cannot send an Authorization header).
+function trackObjectUrl(url) {
+  activeObjectUrls.add(url);
+  return url;
+}
+
+async function fetchImageBlob(url) {
+  const res = await fetch(url, { headers: tokenHeader() });
+  if (!res.ok) throw new Error(`image request failed (${res.status})`);
+  return trackObjectUrl(URL.createObjectURL(await res.blob()));
+}
+
+function revokeObjectUrls() {
+  for (const url of activeObjectUrls) URL.revokeObjectURL(url);
+  activeObjectUrls.clear();
+}
+
+function renderImageThumb(image) {
+  const img = document.createElement("img");
+  img.className = "message-image";
+  img.alt = "Image";
+  img.loading = "lazy";
+  img.title = "Open full size";
+  img.addEventListener("click", () => openFullImage(image));
+  fetchImageBlob(image.thumbnailUrl)
+    .then((src) => {
+      img.src = src;
+    })
+    .catch(() => {
+      img.alt = "Image unavailable";
+      img.classList.add("message-image-missing");
+    });
+  return img;
+}
+
+function openFullImage(image) {
+  clearImageMessage();
+  fetchImageBlob(image.url)
+    .then((src) => {
+      imageLightboxImg.src = src;
+      imageLightbox.hidden = false;
+    })
+    .catch(() => showImageMessage("Could not open the full-size image.", true));
+}
+
+function closeFullImage() {
+  imageLightbox.hidden = true;
+  const src = imageLightboxImg.getAttribute("src");
+  if (src && src.startsWith("blob:")) {
+    URL.revokeObjectURL(src);
+    activeObjectUrls.delete(src);
+  }
+  imageLightboxImg.removeAttribute("src");
+}
+
+imageLightboxClose.addEventListener("click", closeFullImage);
+imageLightbox.addEventListener("click", (event) => {
+  if (event.target === imageLightbox) closeFullImage();
+});
+
+attachButton.addEventListener("click", () => imageInput.click());
+
+imageInput.addEventListener("change", async () => {
+  const file = imageInput.files?.[0];
+  imageInput.value = ""; // allow selecting the same file again later
+  if (!file) return;
+  if (!currentConversation) {
+    showImageMessage("Open a chat to send an image.", true);
+    return;
+  }
+
+  const mimeType = imageMimeType(file);
+  if (!mimeType) {
+    // Refuse unsupported types in the page before uploading anything.
+    showImageMessage("Only JPEG and PNG images are supported.", true);
+    return;
+  }
+  clearImageMessage();
+
+  const token = getToken();
+  if (!token) return;
+
+  const res = await fetch("/images", {
+    method: "POST",
+    headers: {
+      "content-type": mimeType,
+      authorization: `Bearer ${token}`,
+    },
+    body: file,
+  });
+
+  if (res.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(PHONE_KEY);
+    showLoggedOut();
+    return;
+  }
+
+  let uploaded = null;
+  try {
+    uploaded = await res.json();
+  } catch {
+    // Non-JSON error body.
+  }
+  if (res.status !== 201 || !uploaded?.id) {
+    showImageMessage(uploaded?.error ?? "Could not upload the image.", true);
+    return;
+  }
+
+  connectSocket();
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    showImageMessage("Not connected — the image was not sent.", true);
+    return;
+  }
+  socket.send(
+    JSON.stringify({
+      type: "image",
+      conversationId: currentConversation.id,
+      imageId: uploaded.id,
+    }),
+  );
+});
 
 backToChatsButton.addEventListener("click", loadConversations);
 
