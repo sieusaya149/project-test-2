@@ -156,10 +156,12 @@ function showLoggedIn(phone) {
   loggedInPhone.textContent = phone;
   loginFormView.hidden = true;
   loggedInView.hidden = false;
+  connectSocket();
   loadConversations();
 }
 
 function showLoggedOut() {
+  closeSocket();
   loggedInView.hidden = true;
   loginFormView.hidden = false;
   phoneForm.hidden = false;
@@ -178,6 +180,76 @@ const chatView = document.getElementById("chat-view");
 const chatTitle = document.getElementById("chat-title");
 const messageList = document.getElementById("message-list");
 const backToChatsButton = document.getElementById("back-to-chats");
+const messageForm = document.getElementById("message-form");
+const messageInput = document.getElementById("message-input");
+
+let currentConversation = null;
+let socket = null;
+const renderedMessageIds = new Set();
+
+// Opens (or reuses) one WebSocket per logged-in session so this tab receives
+// live messages without reloading. `socket` keeps the current connection.
+function connectSocket() {
+  const token = getToken();
+  if (!token) return;
+  if (
+    socket &&
+    (socket.readyState === WebSocket.CONNECTING ||
+      socket.readyState === WebSocket.OPEN)
+  ) {
+    return;
+  }
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${scheme}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+  const ws = new WebSocket(url);
+  socket = ws;
+  ws.addEventListener("message", (event) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    handleSocketEvent(parsed);
+  });
+  ws.addEventListener("close", () => {
+    if (socket === ws) socket = null;
+  });
+}
+
+function closeSocket() {
+  const ws = socket;
+  socket = null;
+  if (!ws) return;
+  try {
+    ws.close();
+  } catch {
+    /* ignore */
+  }
+}
+
+function handleSocketEvent(parsed) {
+  if (!parsed || typeof parsed !== "object") return;
+  if (parsed.type === "message") {
+    appendMessage(parsed.message);
+  } else if (parsed.type === "status") {
+    // The sender's own message is confirmed via a `status` acknowledgement,
+    // so show it in the thread once the server has accepted it.
+    if (parsed.message && parsed.message.sender === getPhone()) {
+      appendMessage(parsed.message);
+    }
+  }
+}
+
+function appendMessage(message) {
+  if (!message || !message.id) return;
+  if (!currentConversation || message.conversationId !== currentConversation.id) {
+    return;
+  }
+  if (renderedMessageIds.has(message.id)) return;
+  renderedMessageIds.add(message.id);
+  messageList.appendChild(renderMessageItem(message));
+}
 
 function tokenHeader() {
   const token = localStorage.getItem(TOKEN_KEY);
@@ -210,11 +282,13 @@ function formatTime(timestamp) {
 }
 
 function showChatsLoggedOut() {
+  currentConversation = null;
   chatsLoggedOut.hidden = false;
   chatsListView.hidden = true;
   chatView.hidden = true;
   conversationList.replaceChildren();
   messageList.replaceChildren();
+  renderedMessageIds.clear();
 }
 
 async function loadConversations() {
@@ -232,6 +306,7 @@ async function loadConversations() {
 }
 
 function renderConversations(conversations) {
+  currentConversation = null;
   chatsLoggedOut.hidden = true;
   chatsListView.hidden = false;
   chatView.hidden = true;
@@ -272,10 +347,12 @@ function renderConversations(conversations) {
 }
 
 async function openConversation(conversation) {
+  currentConversation = conversation;
   const res = await fetch(`/conversations/${conversation.id}/messages`, {
     headers: tokenHeader(),
   });
   if (res.status !== 200) {
+    currentConversation = null;
     // The conversation is gone (or we were signed out): refresh the list.
     loadConversations();
     return;
@@ -285,11 +362,31 @@ async function openConversation(conversation) {
   chatsLoggedOut.hidden = true;
   chatsListView.hidden = true;
   chatView.hidden = false;
+  messageInput.value = "";
   renderMessages(body.messages ?? []);
+  connectSocket();
+  messageInput.focus();
+}
+
+function renderMessageItem(message) {
+  const li = document.createElement("li");
+  li.className = "message";
+
+  const sender = document.createElement("span");
+  sender.className = "message-sender";
+  sender.textContent = message.sender;
+
+  const content = document.createElement("span");
+  content.className = "message-content";
+  content.textContent = message.kind === "image" ? "📷 Photo" : message.text;
+
+  li.append(sender, content);
+  return li;
 }
 
 function renderMessages(messages) {
   messageList.replaceChildren();
+  renderedMessageIds.clear();
   if (messages.length === 0) {
     const empty = document.createElement("li");
     empty.className = "message-empty";
@@ -299,23 +396,29 @@ function renderMessages(messages) {
   }
   // The API returns newest first; show oldest first in the thread.
   for (const message of [...messages].reverse()) {
-    const li = document.createElement("li");
-    li.className = "message";
-
-    const sender = document.createElement("span");
-    sender.className = "message-sender";
-    sender.textContent = message.sender;
-
-    const content = document.createElement("span");
-    content.className = "message-content";
-    content.textContent = message.kind === "image" ? "📷 Photo" : message.text;
-
-    li.append(sender, content);
-    messageList.appendChild(li);
+    renderedMessageIds.add(message.id);
+    messageList.appendChild(renderMessageItem(message));
   }
 }
 
 backToChatsButton.addEventListener("click", loadConversations);
+
+messageForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = messageInput.value.trim();
+  if (!text || !currentConversation) return;
+  connectSocket();
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(
+    JSON.stringify({
+      type: "send",
+      conversationId: currentConversation.id,
+      text,
+    }),
+  );
+  messageInput.value = "";
+  messageInput.focus();
+});
 
 // ---- Friends page (ZALO-14) ----
 
@@ -329,6 +432,10 @@ const requestsList = document.getElementById("requests-list");
 
 function getToken() {
   return localStorage.getItem(TOKEN_KEY);
+}
+
+function getPhone() {
+  return localStorage.getItem(PHONE_KEY);
 }
 
 async function authedFetch(url, options = {}) {
