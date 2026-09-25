@@ -19,9 +19,8 @@ for (const link of links) {
       other.classList.toggle("is-active", other === link);
     }
 
-    if (target === "friends") {
-      loadFriendsPage();
-    }
+    if (target === "chats") loadConversations();
+    if (target === "friends") loadFriendsPage();
   });
 }
 
@@ -157,6 +156,7 @@ function showLoggedIn(phone) {
   loggedInPhone.textContent = phone;
   loginFormView.hidden = true;
   loggedInView.hidden = false;
+  loadConversations();
 }
 
 function showLoggedOut() {
@@ -166,7 +166,156 @@ function showLoggedOut() {
   codeForm.hidden = true;
   clearMessage();
   hideDevCode();
+  showChatsLoggedOut();
 }
+
+// ---- Chats: list conversations and open one (ZALO-15) ----
+
+const chatsLoggedOut = document.getElementById("chats-logged-out");
+const chatsListView = document.getElementById("chats-list-view");
+const conversationList = document.getElementById("conversation-list");
+const chatView = document.getElementById("chat-view");
+const chatTitle = document.getElementById("chat-title");
+const messageList = document.getElementById("message-list");
+const backToChatsButton = document.getElementById("back-to-chats");
+
+function tokenHeader() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
+function conversationTitle(conversation) {
+  if (conversation.type === "group") {
+    return conversation.name || conversation.participants.join(", ");
+  }
+  const me = localStorage.getItem(PHONE_KEY);
+  return (
+    conversation.participants.find((p) => p !== me) ??
+    conversation.participants[0] ??
+    "Conversation"
+  );
+}
+
+function messagePreview(message) {
+  if (!message) return "No messages yet";
+  return message.kind === "image" ? "📷 Photo" : message.text;
+}
+
+function formatTime(timestamp) {
+  if (!timestamp) return "";
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function showChatsLoggedOut() {
+  chatsLoggedOut.hidden = false;
+  chatsListView.hidden = true;
+  chatView.hidden = true;
+  conversationList.replaceChildren();
+  messageList.replaceChildren();
+}
+
+async function loadConversations() {
+  if (!localStorage.getItem(TOKEN_KEY)) {
+    showChatsLoggedOut();
+    return;
+  }
+  const res = await fetch("/conversations", { headers: tokenHeader() });
+  if (res.status !== 200) {
+    showChatsLoggedOut();
+    return;
+  }
+  const body = await res.json();
+  renderConversations(body.conversations ?? []);
+}
+
+function renderConversations(conversations) {
+  chatsLoggedOut.hidden = true;
+  chatsListView.hidden = false;
+  chatView.hidden = true;
+  conversationList.replaceChildren();
+
+  if (conversations.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "conversation-empty";
+    empty.textContent = "No conversations yet.";
+    conversationList.appendChild(empty);
+    return;
+  }
+
+  for (const conversation of conversations) {
+    const li = document.createElement("li");
+    li.className = "conversation-item";
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+
+    const title = document.createElement("span");
+    title.className = "conversation-title";
+    title.textContent = conversationTitle(conversation);
+
+    const preview = document.createElement("span");
+    preview.className = "conversation-preview";
+    preview.textContent = messagePreview(conversation.latestMessage);
+
+    const time = document.createElement("span");
+    time.className = "conversation-time";
+    time.textContent = formatTime(
+      conversation.latestMessage?.createdAt ?? conversation.createdAt,
+    );
+
+    li.append(title, preview, time);
+    li.addEventListener("click", () => openConversation(conversation));
+    conversationList.appendChild(li);
+  }
+}
+
+async function openConversation(conversation) {
+  const res = await fetch(`/conversations/${conversation.id}/messages`, {
+    headers: tokenHeader(),
+  });
+  if (res.status !== 200) {
+    // The conversation is gone (or we were signed out): refresh the list.
+    loadConversations();
+    return;
+  }
+  const body = await res.json();
+  chatTitle.textContent = conversationTitle(conversation);
+  chatsLoggedOut.hidden = true;
+  chatsListView.hidden = true;
+  chatView.hidden = false;
+  renderMessages(body.messages ?? []);
+}
+
+function renderMessages(messages) {
+  messageList.replaceChildren();
+  if (messages.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "message-empty";
+    empty.textContent = "No messages yet.";
+    messageList.appendChild(empty);
+    return;
+  }
+  // The API returns newest first; show oldest first in the thread.
+  for (const message of [...messages].reverse()) {
+    const li = document.createElement("li");
+    li.className = "message";
+
+    const sender = document.createElement("span");
+    sender.className = "message-sender";
+    sender.textContent = message.sender;
+
+    const content = document.createElement("span");
+    content.className = "message-content";
+    content.textContent = message.kind === "image" ? "📷 Photo" : message.text;
+
+    li.append(sender, content);
+    messageList.appendChild(li);
+  }
+}
+
+backToChatsButton.addEventListener("click", loadConversations);
 
 // ---- Friends page (ZALO-14) ----
 

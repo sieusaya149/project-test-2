@@ -19,7 +19,21 @@
     <main class="app-main">
       <section id="chats" class="panel">
         <h2>Chats</h2>
-        <p>Your conversations will appear here.</p>
+        <p id="chats-logged-out" class="empty-state">
+          Log in to see your conversations.
+        </p>
+        <div id="chats-list-view" hidden>
+          <ul id="conversation-list" class="conversation-list"></ul>
+        </div>
+        <div id="chat-view" class="chat-view" hidden>
+          <header class="chat-header">
+            <button type="button" id="back-to-chats" class="btn btn-ghost">
+              ← Chats
+            </button>
+            <h3 id="chat-title">Conversation</h3>
+          </header>
+          <ol id="message-list" class="message-list"></ol>
+        </div>
       </section>
       <section id="friends" class="panel" hidden>
         <h2>Friends</h2>

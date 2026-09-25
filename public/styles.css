@@ -173,6 +173,107 @@ body {
   margin-top: 0;
 }
 
+/* ---- Chats: conversation list and open view (ZALO-15) ---- */
+
+.empty-state {
+  color: var(--muted);
+}
+
+.conversation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.conversation-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "title time"
+    "preview time";
+  gap: 2px 12px;
+  padding: 12px 8px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.conversation-item:last-child {
+  border-bottom: none;
+}
+
+.conversation-item:hover,
+.conversation-item:focus-visible {
+  background: #f6f8fb;
+  outline: none;
+}
+
+.conversation-title {
+  grid-area: title;
+  font-weight: 600;
+}
+
+.conversation-preview {
+  grid-area: preview;
+  color: var(--muted);
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation-time {
+  grid-area: time;
+  color: var(--muted);
+  font-size: 12px;
+  align-self: start;
+}
+
+.conversation-empty,
+.message-empty {
+  color: var(--muted);
+  padding: 12px 8px;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.chat-header h3 {
+  margin: 0;
+}
+
+.message-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border-radius: 8px;
+}
+
+.message-sender {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--brand);
+}
+
+.message-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ---- Friends page (ZALO-14) ---- */
 
 .friends-section {
@@ -218,3 +319,4 @@ body {
   padding: 6px 12px;
   font-size: 13px;
 }
+
