@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { signJwt, verifyJwt } from "./jwt.js";
 import { computeAccept, WebSocketConnection } from "./websocket.js";
@@ -20,6 +21,12 @@ const DEFAULT_JWT_SECRET = "zalo-dev-secret-change-me";
 // Local phone numbers (with an optional leading "+") between 9 and 15 digits.
 const PHONE_RE = /^\+?\d{9,15}$/;
 const CODE_RE = /^\d{6}$/;
+
+// package.json name/version, read once at startup so the version endpoint
+// never hardcodes them (ZALO-11).
+const pkg = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+);
 const MAX_MESSAGE_LENGTH = 4000;
 const MIN_GROUP_MEMBERS = 2;
 const MAX_GROUP_MEMBERS = 100;
@@ -347,6 +354,10 @@ export function createApp(options = {}) {
 
       if (method === "GET" && pathname === "/health") {
         return json(res, 200, { status: "ok" });
+      }
+
+      if (method === "GET" && pathname === "/api/version") {
+        return json(res, 200, { name: pkg.name, version: pkg.version });
       }
 
       if (method === "POST" && pathname === "/auth/otp") {
