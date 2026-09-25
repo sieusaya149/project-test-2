@@ -1,0 +1,80 @@
+:root {
+  --brand: #0068ff;
+  --brand-dark: #0052cc;
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --text: #1c1e21;
+  --muted: #6b7280;
+  --border: #e5e7eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 12px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-name {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--brand);
+}
+
+.app-nav {
+  display: flex;
+  gap: 8px;
+}
+
+.nav-link {
+  padding: 8px 14px;
+  border-radius: 999px;
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.nav-link:hover {
+  color: var(--brand);
+  background: #eef4ff;
+}
+
+.nav-link.is-active {
+  color: #fff;
+  background: var(--brand);
+}
+
+.app-main {
+  max-width: 720px;
+  margin: 32px auto;
+  padding: 0 16px;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+}
+
+.panel h2 {
+  margin-top: 0;
+}
+
+.panel p {
+  color: var(--muted);
+}
