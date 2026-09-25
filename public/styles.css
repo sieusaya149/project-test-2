@@ -320,3 +320,27 @@ body {
   font-size: 13px;
 }
 
+/* ---- Chat window: message box (ZALO-16) ---- */
+
+.message-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.message-form input {
+  flex: 1;
+  padding: 10px 12px;
+  font-size: 15px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.message-form input:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(0, 104, 255, 0.15);
+}
+
