@@ -256,6 +256,10 @@ function handleSocketEvent(parsed) {
     if (parsed.message && parsed.message.sender === getPhone()) {
       appendMessage(parsed.message);
     }
+  } else if (parsed.type === "message:edited") {
+    updateMessage(parsed.message);
+  } else if (parsed.type === "message:deleted") {
+    markMessageDeleted(parsed.conversationId, parsed.messageId);
   }
 }
 
@@ -368,6 +372,7 @@ function conversationTitle(conversation) {
 
 function messagePreview(message) {
   if (!message) return "No messages yet";
+  if (message.deleted) return "Message deleted";
   return message.kind === "image" ? "📷 Photo" : message.text;
 }
 
@@ -522,8 +527,9 @@ function markConversationRead(conversation, messages) {
 
 function renderMessageItem(message) {
   const li = document.createElement("li");
-  li.className = "message";
+  li.className = message.deleted ? "message message-deleted" : "message";
   li.dataset.seq = String(message.seq ?? 0);
+  li.dataset.messageId = message.id;
   li.dataset.id = message.id;
 
   const sender = document.createElement("span");
@@ -532,7 +538,9 @@ function renderMessageItem(message) {
 
   const content = document.createElement("span");
   content.className = "message-content";
-  if (message.kind === "image") {
+  if (message.deleted) {
+    content.textContent = "message deleted";
+  } else if (message.kind === "image") {
     // Show a thumbnail that opens the full-size image on click (ZALO-17).
     content.appendChild(renderImageThumb(message.image));
   } else {
@@ -540,6 +548,36 @@ function renderMessageItem(message) {
   }
 
   li.append(sender, content);
+
+  if (message.edited && !message.deleted) {
+    const edited = document.createElement("span");
+    edited.className = "message-edited";
+    edited.textContent = "edited";
+    li.appendChild(edited);
+  }
+
+  // Edit/delete affordances appear only on the user's own, not-yet-deleted
+  // messages (ZALO-23).
+  if (message.sender === getPhone() && !message.deleted) {
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    if (message.kind !== "image") {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "message-action";
+      edit.textContent = "Edit";
+      edit.addEventListener("click", () => startEdit(message));
+      actions.appendChild(edit);
+    }
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "message-action";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => deleteMessage(message));
+    actions.appendChild(del);
+    li.appendChild(actions);
+  }
+
   return li;
 }
 
@@ -563,6 +601,48 @@ function renderMessages(messages) {
   }
 }
 
+// ---- Edit & delete messages (ZALO-23) ----
+
+function findMessageItem(id) {
+  for (const child of messageList.children) {
+    if (child.dataset?.messageId === id) return child;
+  }
+  return null;
+}
+
+function messageContent(li) {
+  return li.children.find((c) => c.className === "message-content") ?? null;
+}
+
+// Re-renders a message in place after it changed (edited) without disturbing
+// its `seq` position.
+function updateMessage(message) {
+  if (!message || !message.id) return;
+  if (!currentConversation || message.conversationId !== currentConversation.id) {
+    return;
+  }
+  const existing = findMessageItem(message.id);
+  if (!existing) return;
+  const replacement = renderMessageItem(message);
+  messageList.insertBefore(replacement, existing);
+  existing.remove();
+}
+
+// Turns an already-rendered message into its "message deleted" placeholder.
+function markMessageDeleted(conversationId, messageId) {
+  if (!currentConversation || conversationId !== currentConversation.id) return;
+  const li = findMessageItem(messageId);
+  if (!li) return;
+  li.className = "message message-deleted";
+  const content = messageContent(li);
+  if (content) content.textContent = "message deleted";
+  for (const child of [...li.children]) {
+    if (child.className === "message-edited" || child.className === "message-actions") {
+      child.remove();
+    }
+  }
+}
+
 // ---- Search messages in a conversation (ZALO-25) ----
 
 function clearSearchHighlights() {
@@ -571,6 +651,71 @@ function clearSearchHighlights() {
       child.classList.remove("is-highlight");
     }
   }
+}
+
+// Inline edit: swap the message text for an input with Save/Cancel.
+function startEdit(message) {
+  const li = findMessageItem(message.id);
+  if (!li) return;
+  const content = messageContent(li);
+  if (!content) return;
+
+  const form = document.createElement("form");
+  form.className = "message-edit-form";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "message-edit-input";
+  input.value = message.text ?? "";
+  input.setAttribute("aria-label", "Edit message");
+  form.appendChild(input);
+
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "btn btn-primary btn-small";
+  save.textContent = "Save";
+  form.appendChild(save);
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn btn-ghost btn-small";
+  cancel.textContent = "Cancel";
+  form.appendChild(cancel);
+
+  content.replaceChildren(form);
+  input.focus();
+
+  cancel.addEventListener("click", () => updateMessage(message));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    submitEdit(message, text);
+  });
+}
+
+async function submitEdit(message, text) {
+  const { status, body } = await authedFetch(
+    `/conversations/${message.conversationId}/messages/${message.id}`,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    },
+  );
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) return;
+  updateMessage(body);
+}
+
+async function deleteMessage(message) {
+  const { status } = await authedFetch(
+    `/conversations/${message.conversationId}/messages/${message.id}`,
+    { method: "DELETE" },
+  );
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) return;
+  markMessageDeleted(message.conversationId, message.id);
 }
 
 function showSearchMessage(text, isError) {
@@ -1023,6 +1168,8 @@ friendRequestForm.addEventListener("submit", async (event) => {
 globalThis.__zaloChat = {
   appendMessage,
   renderMessages,
+  updateMessage,
+  markMessageDeleted,
   renderConversations,
   noteUnreadMessage,
   clearUnreadBadge,
