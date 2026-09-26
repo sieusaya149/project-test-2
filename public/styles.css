@@ -287,6 +287,59 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* ---- Chat window: edit & delete messages (ZALO-23) ---- */
+
+.message-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.message-action {
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.message-action:hover {
+  background: #eef4ff;
+  color: var(--brand);
+}
+
+.message-edited {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.message.message-deleted .message-content {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.message-edit-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.message-edit-input {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.message-edit-input:focus {
+  outline: none;
+  border-color: var(--brand);
+}
+
 /* ---- Friends page (ZALO-14) ---- */
 
 .friends-section {

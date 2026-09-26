@@ -233,6 +233,12 @@ export function createApp(options = {}) {
   /** The wire representation of a message, with the read count for groups. */
   function messageView(conversation, message) {
     const view = { ...message };
+    if (message.deleted) {
+      // A soft-deleted message keeps its slot so history stays consistent, but
+      // never leaks its original text or image over the wire (ZALO-23).
+      view.text = "";
+      view.image = undefined;
+    }
     if (conversation.type === "group") {
       view.readCount = message.readBy.length;
     }
@@ -273,6 +279,16 @@ export function createApp(options = {}) {
       message: messageView(conversation, message),
     });
     for (const participant of message.deliveredTo) {
+      const set = connections.get(participant);
+      if (!set || set.size === 0) continue;
+      for (const conn of [...set]) conn.sendText(payload);
+    }
+  }
+
+  /** Sends an already-serialized JSON payload to every online participant. */
+  function fanOut(conversation, exclude, payload) {
+    for (const participant of conversation.participants) {
+      if (participant === exclude) continue;
       const set = connections.get(participant);
       if (!set || set.size === 0) continue;
       for (const conn of [...set]) conn.sendText(payload);
@@ -712,6 +728,85 @@ export function createApp(options = {}) {
             nextCursor: page.length > 0 ? page[page.length - 1].id : null,
           });
         }
+      }
+
+      // ---- Edit & delete messages (ZALO-23) ----
+
+      const messageRoute = pathname.match(
+        /^\/conversations\/([^/]+)\/messages\/([^/]+)$/,
+      );
+      if (messageRoute && (method === "PATCH" || method === "DELETE")) {
+        const me = requireAuth(req, res);
+        if (!me) return;
+
+        const conversation = conversations.get(messageRoute[1]);
+        if (!conversation) {
+          return json(res, 404, { error: "conversation not found" });
+        }
+        if (!conversation.participants.includes(me)) {
+          return json(res, 403, { error: "not a participant" });
+        }
+        const message = (conversation.messages ?? []).find(
+          (m) => m.id === messageRoute[2],
+        );
+        if (!message) {
+          return json(res, 404, { error: "message not found" });
+        }
+        if (message.sender !== me) {
+          return json(res, 403, {
+            error: "can only edit or delete your own messages",
+          });
+        }
+
+        if (method === "PATCH") {
+          const body = await readJson(req);
+          if (body === null) {
+            return json(res, 400, { error: "invalid JSON body" });
+          }
+          const { text } = body;
+          if (typeof text !== "string" || text.trim() === "") {
+            return json(res, 400, { error: "text must be a non-empty string" });
+          }
+          if (text.length > MAX_MESSAGE_LENGTH) {
+            return json(res, 400, { error: "text too long" });
+          }
+          if (message.deleted) {
+            return json(res, 409, { error: "cannot edit a deleted message" });
+          }
+          if (message.kind !== "text") {
+            return json(res, 400, { error: "only text messages can be edited" });
+          }
+          message.text = text;
+          message.edited = true;
+          message.editedAt = now();
+          fanOut(
+            conversation,
+            me,
+            JSON.stringify({
+              type: "message:edited",
+              message: messageView(conversation, message),
+            }),
+          );
+          return json(res, 200, messageView(conversation, message));
+        }
+
+        // DELETE: soft-delete, keeping the slot so ordering stays intact.
+        if (message.deleted) {
+          // Deleting an already-deleted message is a no-op.
+          return json(res, 200, messageView(conversation, message));
+        }
+        message.deleted = true;
+        message.deletedAt = now();
+        fanOut(
+          conversation,
+          me,
+          JSON.stringify({
+            type: "message:deleted",
+            conversationId: conversation.id,
+            messageId: message.id,
+          }),
+        );
+        return json(res, 200, messageView(conversation, message));
       }
 
       // ---- Group chat (ZALO-6) ----
