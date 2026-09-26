@@ -637,8 +637,14 @@ export function createApp(options = {}) {
           if (!conversation.participants.includes(me)) continue;
           const messages = conversation.messages ?? [];
           let latest = null;
+          let unreadCount = 0;
           for (const message of messages) {
             if (latest === null || message.seq > latest.seq) latest = message;
+            // A message is unread for the caller when someone else sent it and
+            // the caller is not yet in its read receipts (ZALO-24).
+            if (message.sender !== me && !message.readBy.includes(me)) {
+              unreadCount += 1;
+            }
           }
           list.push({
             id: conversation.id,
@@ -647,6 +653,7 @@ export function createApp(options = {}) {
             participants: [...conversation.participants],
             latestMessage: latest ? messageView(conversation, latest) : null,
             createdAt: conversation.createdAt,
+            unreadCount,
           });
         }
 
