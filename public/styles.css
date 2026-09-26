@@ -357,6 +357,16 @@ body {
   box-shadow: 0 0 0 3px rgba(0, 104, 255, 0.15);
 }
 
+/* ---- Chat window: typing indicator (ZALO-22) ---- */
+
+.typing-indicator {
+  margin: 8px 0 0;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--muted);
+  min-height: 18px;
+}
+
 /* ---- Chat window: attach and show images (ZALO-17) ---- */
 
 .message-form .btn-ghost {

@@ -182,6 +182,7 @@ const messageList = document.getElementById("message-list");
 const backToChatsButton = document.getElementById("back-to-chats");
 const messageForm = document.getElementById("message-form");
 const messageInput = document.getElementById("message-input");
+const typingIndicator = document.getElementById("typing-indicator");
 const imageInput = document.getElementById("image-input");
 const attachButton = document.getElementById("attach-button");
 const imageUploadMessage = document.getElementById("image-upload-message");
@@ -194,6 +195,13 @@ let socket = null;
 const renderedMessageIds = new Set();
 // Blob URLs created for image thumbnails/full-size views (ZALO-17).
 const activeObjectUrls = new Set();
+// Typing-indicator state (ZALO-22): throttle outgoing events to at most one
+// every 2s, and auto-clear the incoming indicator 5s after the last event.
+const TYPING_THROTTLE_MS = 2000;
+const TYPING_CLEAR_MS = 5000;
+let lastTypingSentAt = 0;
+let typingSendTimer = null;
+let typingClearTimer = null;
 
 // Opens (or reuses) one WebSocket per logged-in session so this tab receives
 // live messages without reloading. `socket` keeps the current connection.
@@ -236,6 +244,87 @@ function closeSocket() {
   }
 }
 
+// ---- Typing indicators (ZALO-22) ----
+
+/** Cancels a pending trailing typing send (e.g. when the message is sent). */
+function cancelTypingSendTimer() {
+  if (typingSendTimer) {
+    clearTimeout(typingSendTimer);
+    typingSendTimer = null;
+  }
+}
+
+/** Hides the "… is typing" indicator and cancels its auto-clear timer. */
+function clearTypingIndicator() {
+  if (typingClearTimer) {
+    clearTimeout(typingClearTimer);
+    typingClearTimer = null;
+  }
+  typingIndicator.textContent = "";
+  typingIndicator.hidden = true;
+}
+
+/**
+ * Sends a `typing` event over the session WebSocket, throttled to at most one
+ * event every 2s. Rapid keystrokes inside the window only schedule a single
+ * trailing send, so the other side is not spammed.
+ */
+function sendTyping() {
+  if (!currentConversation || !socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const now = Date.now();
+  const elapsed = now - lastTypingSentAt;
+  if (elapsed >= TYPING_THROTTLE_MS) {
+    lastTypingSentAt = now;
+    socket.send(
+      JSON.stringify({
+        type: "typing",
+        conversationId: currentConversation.id,
+        isTyping: true,
+      }),
+    );
+    return;
+  }
+  // One trailing send is enough to cover the whole throttled burst.
+  if (typingSendTimer) return;
+  typingSendTimer = setTimeout(() => {
+    typingSendTimer = null;
+    if (!currentConversation || !socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    lastTypingSentAt = Date.now();
+    socket.send(
+      JSON.stringify({
+        type: "typing",
+        conversationId: currentConversation.id,
+        isTyping: true,
+      }),
+    );
+  }, TYPING_THROTTLE_MS - elapsed);
+}
+
+/**
+ * Shows (or refreshes) the "… is typing" indicator for a remote peer in the
+ * currently open conversation. Cleared automatically 5s after the last event.
+ */
+function showTypingIndicator(event) {
+  if (!event || typeof event !== "object") return;
+  if (!currentConversation || event.conversationId !== currentConversation.id) {
+    return;
+  }
+  if (event.sender === getPhone()) return; // never show our own typing
+  if (event.isTyping === false) {
+    clearTypingIndicator();
+    return;
+  }
+  const name = event.sender || "Someone";
+  typingIndicator.textContent = `${name} is typing…`;
+  typingIndicator.hidden = false;
+  if (typingClearTimer) clearTimeout(typingClearTimer);
+  typingClearTimer = setTimeout(clearTypingIndicator, TYPING_CLEAR_MS);
+}
+
 function handleSocketEvent(parsed) {
   if (!parsed || typeof parsed !== "object") return;
   if (parsed.type === "message") {
@@ -246,6 +335,8 @@ function handleSocketEvent(parsed) {
     if (parsed.message && parsed.message.sender === getPhone()) {
       appendMessage(parsed.message);
     }
+  } else if (parsed.type === "typing") {
+    showTypingIndicator(parsed);
   }
 }
 
@@ -254,6 +345,8 @@ function appendMessage(message) {
   if (!currentConversation || message.conversationId !== currentConversation.id) {
     return;
   }
+  // A real message means the other side is no longer "typing".
+  clearTypingIndicator();
   if (renderedMessageIds.has(message.id)) return;
   renderedMessageIds.add(message.id);
   // The empty-state placeholder is replaced by the first real message.
@@ -324,6 +417,8 @@ function formatTime(timestamp) {
 
 function showChatsLoggedOut() {
   currentConversation = null;
+  cancelTypingSendTimer();
+  clearTypingIndicator();
   chatsLoggedOut.hidden = false;
   chatsListView.hidden = true;
   chatView.hidden = true;
@@ -391,6 +486,8 @@ function renderConversations(conversations) {
 
 async function openConversation(conversation) {
   currentConversation = conversation;
+  cancelTypingSendTimer();
+  clearTypingIndicator();
   const res = await fetch(`/conversations/${conversation.id}/messages`, {
     headers: tokenHeader(),
   });
@@ -622,7 +719,17 @@ messageForm.addEventListener("submit", (event) => {
     }),
   );
   messageInput.value = "";
+  // The user just sent their message, so stop announcing typing.
+  cancelTypingSendTimer();
+  clearTypingIndicator();
   messageInput.focus();
+});
+
+// Announce "typing" as the user types in an open chat, throttled to at most
+// one event every 2 seconds (ZALO-22).
+messageInput.addEventListener("input", () => {
+  if (!messageInput.value.trim()) return; // nothing meaningful being typed
+  sendTyping();
 });
 
 // ---- Friends page (ZALO-14) ----
@@ -817,6 +924,10 @@ friendRequestForm.addEventListener("submit", async (event) => {
 globalThis.__zaloChat = {
   appendMessage,
   renderMessages,
+  connectSocket,
+  sendTyping,
+  clearTypingIndicator,
+  showTypingIndicator,
   get currentConversation() {
     return currentConversation;
   },

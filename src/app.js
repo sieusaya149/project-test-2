@@ -280,6 +280,26 @@ export function createApp(options = {}) {
   }
 
   /**
+   * Relays a typing indicator to every other online participant (never echoing
+   * back to the sender). Typing is transient, so it is only delivered to
+   * currently open sockets rather than buffered for offline users (ZALO-22).
+   */
+  function relayTyping(conversation, sender, isTyping) {
+    const payload = JSON.stringify({
+      type: "typing",
+      conversationId: conversation.id,
+      sender,
+      isTyping,
+    });
+    for (const participant of conversation.participants) {
+      if (participant === sender) continue;
+      const set = connections.get(participant);
+      if (!set || set.size === 0) continue;
+      for (const conn of [...set]) conn.sendText(payload);
+    }
+  }
+
+  /**
    * Pushes the messages `phone` missed while offline to a freshly (re)connected
    * socket, ordered by the monotonic `seq` so they always arrive in send order
    * even when several share the same `createdAt` (ZALO-10).
@@ -323,6 +343,22 @@ export function createApp(options = {}) {
     pushStatus(message.sender, conversation, message);
   }
 
+  function handleTyping(phone, conn, parsed) {
+    const { conversationId } = parsed;
+    const conversation = conversations.get(conversationId);
+    if (!conversation) return sendWsError(conn, "conversation not found");
+    if (!conversation.participants.includes(phone)) {
+      return sendWsError(conn, "not a participant");
+    }
+    if (conversation.type !== "group") {
+      const recipient = conversation.participants.find((p) => p !== phone);
+      if (!isFriend(phone, recipient)) {
+        return sendWsError(conn, "can only message friends");
+      }
+    }
+    relayTyping(conversation, phone, parsed.isTyping !== false);
+  }
+
   function handleWsMessage(phone, conn, raw) {
     let parsed;
     try {
@@ -334,6 +370,7 @@ export function createApp(options = {}) {
       return sendWsError(conn, "unsupported message type");
     }
     if (parsed.type === "read") return handleRead(phone, conn, parsed);
+    if (parsed.type === "typing") return handleTyping(phone, conn, parsed);
 
     const kind =
       parsed.type === "send" ? "text" : parsed.type === "image" ? "image" : null;
