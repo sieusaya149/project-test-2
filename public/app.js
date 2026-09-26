@@ -189,6 +189,10 @@ const imageUploadMessage = document.getElementById("image-upload-message");
 const imageLightbox = document.getElementById("image-lightbox");
 const imageLightboxImg = document.getElementById("image-lightbox-img");
 const imageLightboxClose = document.getElementById("image-lightbox-close");
+const searchForm = document.getElementById("search-form");
+const searchInput = document.getElementById("search-input");
+const searchMessage = document.getElementById("search-message");
+const clearSearchButton = document.getElementById("clear-search");
 
 let currentConversation = null;
 let socket = null;
@@ -202,6 +206,11 @@ const TYPING_CLEAR_MS = 5000;
 let lastTypingSentAt = 0;
 let typingSendTimer = null;
 let typingClearTimer = null;
+// Unread-count badges on the Chats list, keyed by conversation id (ZALO-24).
+const conversationBadges = new Map();
+// Highest message `seq` already reflected in the rendered list, so buffered
+// messages delivered right after a connect are not double-counted.
+const conversationHighWater = new Map();
 
 // Opens (or reuses) one WebSocket per logged-in session so this tab receives
 // live messages without reloading. `socket` keeps the current connection.
@@ -329,6 +338,7 @@ function handleSocketEvent(parsed) {
   if (!parsed || typeof parsed !== "object") return;
   if (parsed.type === "message") {
     appendMessage(parsed.message);
+    noteUnreadMessage(parsed.message);
   } else if (parsed.type === "status") {
     // The sender's own message is confirmed via a `status` acknowledgement,
     // so show it in the thread once the server has accepted it.
@@ -337,7 +347,58 @@ function handleSocketEvent(parsed) {
     }
   } else if (parsed.type === "typing") {
     showTypingIndicator(parsed);
+  } else if (parsed.type === "message:edited") {
+    updateMessage(parsed.message);
+  } else if (parsed.type === "message:deleted") {
+    markMessageDeleted(parsed.conversationId, parsed.messageId);
   }
+}
+
+// Sends a read receipt over the socket (best-effort when it is not open yet).
+function sendRead(conversationId, messageId) {
+  const ws = socket;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "read", conversationId, messageId }));
+}
+
+/**
+ * Keeps the unread badges accurate as messages arrive live: an incoming
+ * message in the open chat is read right away, while one in any other chat
+ * bumps that conversation's badge by one.
+ */
+function noteUnreadMessage(message) {
+  if (!message || !message.conversationId) return;
+  if (message.sender === getPhone()) return;
+  if (currentConversation && message.conversationId === currentConversation.id) {
+    sendRead(message.conversationId, message.id);
+    return;
+  }
+  bumpUnreadBadge(message);
+}
+
+function bumpUnreadBadge(message) {
+  const { conversationId, seq } = message;
+  const highWater = conversationHighWater.get(conversationId);
+  // A buffered message delivered right after (re)connecting was already counted
+  // in the last GET's unreadCount, so only newer sequences bump the badge.
+  if (highWater !== undefined && seq !== undefined && seq <= highWater) return;
+
+  const badge = conversationBadges.get(conversationId);
+  if (badge) {
+    const count = Number.parseInt(badge.textContent, 10) || 0;
+    badge.textContent = String(count + 1);
+    badge.hidden = false;
+  }
+  if (seq !== undefined && (highWater === undefined || seq > highWater)) {
+    conversationHighWater.set(conversationId, seq);
+  }
+}
+
+function clearUnreadBadge(conversationId) {
+  const badge = conversationBadges.get(conversationId);
+  if (!badge) return;
+  badge.textContent = "";
+  badge.hidden = true;
 }
 
 function appendMessage(message) {
@@ -404,6 +465,7 @@ function conversationTitle(conversation) {
 
 function messagePreview(message) {
   if (!message) return "No messages yet";
+  if (message.deleted) return "Message deleted";
   return message.kind === "image" ? "📷 Photo" : message.text;
 }
 
@@ -423,10 +485,13 @@ function showChatsLoggedOut() {
   chatsListView.hidden = true;
   chatView.hidden = true;
   conversationList.replaceChildren();
+  conversationBadges.clear();
+  conversationHighWater.clear();
   messageList.replaceChildren();
   renderedMessageIds.clear();
   revokeObjectUrls();
   clearImageMessage();
+  resetSearch();
 }
 
 async function loadConversations() {
@@ -449,6 +514,8 @@ function renderConversations(conversations) {
   chatsListView.hidden = false;
   chatView.hidden = true;
   conversationList.replaceChildren();
+  conversationBadges.clear();
+  conversationHighWater.clear();
 
   if (conversations.length === 0) {
     const empty = document.createElement("li");
@@ -478,7 +545,20 @@ function renderConversations(conversations) {
       conversation.latestMessage?.createdAt ?? conversation.createdAt,
     );
 
-    li.append(title, preview, time);
+    const badge = document.createElement("span");
+    badge.className = "conversation-unread";
+    badge.hidden = !(conversation.unreadCount > 0);
+    badge.textContent = conversation.unreadCount > 0
+      ? String(conversation.unreadCount)
+      : "";
+    conversationBadges.set(conversation.id, badge);
+    conversationHighWater.set(conversation.id, conversation.latestMessage?.seq ?? 0);
+
+    const meta = document.createElement("div");
+    meta.className = "conversation-meta";
+    meta.append(time, badge);
+
+    li.append(title, preview, meta);
     li.addEventListener("click", () => openConversation(conversation));
     conversationList.appendChild(li);
   }
@@ -505,14 +585,49 @@ async function openConversation(conversation) {
   messageInput.value = "";
   clearImageMessage();
   renderMessages(body.messages ?? []);
+  resetSearch();
   connectSocket();
+  markConversationRead(conversation, body.messages ?? []);
   messageInput.focus();
+}
+
+/**
+ * Clears the unread badge for the opened conversation and records read receipts
+ * for every message the caller has not read yet, reusing the ZALO-7 read flow.
+ */
+function markConversationRead(conversation, messages) {
+  clearUnreadBadge(conversation.id);
+  const phone = getPhone();
+  const unread = messages.filter(
+    (message) =>
+      message.sender !== phone && !(message.readBy ?? []).includes(phone),
+  );
+  if (unread.length === 0) return;
+
+  const sendReads = () => {
+    const ws = socket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const message of unread) {
+      ws.send(
+        JSON.stringify({
+          type: "read",
+          conversationId: conversation.id,
+          messageId: message.id,
+        }),
+      );
+    }
+  };
+
+  if (socket && socket.readyState === WebSocket.OPEN) sendReads();
+  else if (socket) socket.addEventListener("open", sendReads, { once: true });
 }
 
 function renderMessageItem(message) {
   const li = document.createElement("li");
-  li.className = "message";
+  li.className = message.deleted ? "message message-deleted" : "message";
   li.dataset.seq = String(message.seq ?? 0);
+  li.dataset.messageId = message.id;
+  li.dataset.id = message.id;
 
   const sender = document.createElement("span");
   sender.className = "message-sender";
@@ -520,7 +635,9 @@ function renderMessageItem(message) {
 
   const content = document.createElement("span");
   content.className = "message-content";
-  if (message.kind === "image") {
+  if (message.deleted) {
+    content.textContent = "message deleted";
+  } else if (message.kind === "image") {
     // Show a thumbnail that opens the full-size image on click (ZALO-17).
     content.appendChild(renderImageThumb(message.image));
   } else {
@@ -528,6 +645,36 @@ function renderMessageItem(message) {
   }
 
   li.append(sender, content);
+
+  if (message.edited && !message.deleted) {
+    const edited = document.createElement("span");
+    edited.className = "message-edited";
+    edited.textContent = "edited";
+    li.appendChild(edited);
+  }
+
+  // Edit/delete affordances appear only on the user's own, not-yet-deleted
+  // messages (ZALO-23).
+  if (message.sender === getPhone() && !message.deleted) {
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    if (message.kind !== "image") {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "message-action";
+      edit.textContent = "Edit";
+      edit.addEventListener("click", () => startEdit(message));
+      actions.appendChild(edit);
+    }
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "message-action";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => deleteMessage(message));
+    actions.appendChild(del);
+    li.appendChild(actions);
+  }
+
   return li;
 }
 
@@ -550,6 +697,210 @@ function renderMessages(messages) {
     messageList.appendChild(renderMessageItem(message));
   }
 }
+
+// ---- Edit & delete messages (ZALO-23) ----
+
+function findMessageItem(id) {
+  for (const child of messageList.children) {
+    if (child.dataset?.messageId === id) return child;
+  }
+  return null;
+}
+
+function messageContent(li) {
+  return li.children.find((c) => c.className === "message-content") ?? null;
+}
+
+// Re-renders a message in place after it changed (edited) without disturbing
+// its `seq` position.
+function updateMessage(message) {
+  if (!message || !message.id) return;
+  if (!currentConversation || message.conversationId !== currentConversation.id) {
+    return;
+  }
+  const existing = findMessageItem(message.id);
+  if (!existing) return;
+  const replacement = renderMessageItem(message);
+  messageList.insertBefore(replacement, existing);
+  existing.remove();
+}
+
+// Turns an already-rendered message into its "message deleted" placeholder.
+function markMessageDeleted(conversationId, messageId) {
+  if (!currentConversation || conversationId !== currentConversation.id) return;
+  const li = findMessageItem(messageId);
+  if (!li) return;
+  li.className = "message message-deleted";
+  const content = messageContent(li);
+  if (content) content.textContent = "message deleted";
+  for (const child of [...li.children]) {
+    if (child.className === "message-edited" || child.className === "message-actions") {
+      child.remove();
+    }
+  }
+}
+
+// ---- Search messages in a conversation (ZALO-25) ----
+
+function clearSearchHighlights() {
+  for (const child of messageList.children) {
+    if (child.classList && typeof child.classList.remove === "function") {
+      child.classList.remove("is-highlight");
+    }
+  }
+}
+
+// Inline edit: swap the message text for an input with Save/Cancel.
+function startEdit(message) {
+  const li = findMessageItem(message.id);
+  if (!li) return;
+  const content = messageContent(li);
+  if (!content) return;
+
+  const form = document.createElement("form");
+  form.className = "message-edit-form";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "message-edit-input";
+  input.value = message.text ?? "";
+  input.setAttribute("aria-label", "Edit message");
+  form.appendChild(input);
+
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "btn btn-primary btn-small";
+  save.textContent = "Save";
+  form.appendChild(save);
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "btn btn-ghost btn-small";
+  cancel.textContent = "Cancel";
+  form.appendChild(cancel);
+
+  content.replaceChildren(form);
+  input.focus();
+
+  cancel.addEventListener("click", () => updateMessage(message));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    submitEdit(message, text);
+  });
+}
+
+async function submitEdit(message, text) {
+  const { status, body } = await authedFetch(
+    `/conversations/${message.conversationId}/messages/${message.id}`,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    },
+  );
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) return;
+  updateMessage(body);
+}
+
+async function deleteMessage(message) {
+  const { status } = await authedFetch(
+    `/conversations/${message.conversationId}/messages/${message.id}`,
+    { method: "DELETE" },
+  );
+  if (status === 401) return handleFriendsUnauthorized();
+  if (status !== 200) return;
+  markMessageDeleted(message.conversationId, message.id);
+}
+
+function showSearchMessage(text, isError) {
+  searchMessage.textContent = text;
+  searchMessage.classList.toggle("is-error", Boolean(isError));
+  searchMessage.hidden = false;
+}
+
+function clearSearchMessage() {
+  searchMessage.textContent = "";
+  searchMessage.classList.remove("is-error");
+  searchMessage.hidden = true;
+}
+
+function resetSearch() {
+  searchInput.value = "";
+  clearSearchMessage();
+  clearSearchHighlights();
+  clearSearchButton.hidden = true;
+}
+
+async function searchMessages(query) {
+  query = query.trim();
+  if (!currentConversation) return;
+  if (!query) {
+    // An empty query returns to the full, un-highlighted history.
+    resetSearch();
+    await openConversation(currentConversation);
+    return;
+  }
+
+  const res = await fetch(
+    `/conversations/${currentConversation.id}/messages?q=${encodeURIComponent(query)}`,
+    { headers: tokenHeader() },
+  );
+  if (res.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(PHONE_KEY);
+    showLoggedOut();
+    return;
+  }
+  if (res.status !== 200) {
+    showSearchMessage("Could not search the conversation.", true);
+    return;
+  }
+
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* non-JSON body */
+  }
+  const results = body?.messages ?? [];
+  clearSearchHighlights();
+
+  if (results.length === 0) {
+    clearSearchButton.hidden = true;
+    showSearchMessage("No matching messages.", false);
+    return;
+  }
+
+  // Highlight every match and jump to the most recent one.
+  const matchIds = new Set(results.map((m) => m.id));
+  let mostRecent = null;
+  for (const child of messageList.children) {
+    if (!matchIds.has(child.dataset?.id)) continue;
+    child.classList.add("is-highlight");
+    if (!mostRecent) mostRecent = child;
+  }
+  if (mostRecent && typeof mostRecent.scrollIntoView === "function") {
+    mostRecent.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  clearSearchButton.hidden = false;
+  showSearchMessage(
+    `${results.length} matching ${results.length === 1 ? "message" : "messages"}.`,
+    false,
+  );
+}
+
+searchForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  searchMessages(searchInput.value);
+});
+
+clearSearchButton.addEventListener("click", () => {
+  searchInput.value = "";
+  searchMessages("");
+});
 
 // ---- Send images in the chat (ZALO-17) ----
 
@@ -928,6 +1279,11 @@ globalThis.__zaloChat = {
   sendTyping,
   clearTypingIndicator,
   showTypingIndicator,
+  updateMessage,
+  markMessageDeleted,
+  renderConversations,
+  noteUnreadMessage,
+  clearUnreadBadge,
   get currentConversation() {
     return currentConversation;
   },
