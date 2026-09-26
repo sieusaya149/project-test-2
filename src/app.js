@@ -144,6 +144,26 @@ function codesMatch(a, b) {
 }
 
 /**
+ * The text a message exposes to the search endpoint (ZALO-25). Text messages
+ * search their body; image messages carry no body, so they only match against
+ * their metadata (MIME type, byte size, dimensions).
+ */
+function searchableText(message) {
+  if (typeof message.text === "string") return message.text;
+  if (message.kind === "image" && message.image) {
+    return [
+      message.image.mimeType,
+      message.image.size,
+      message.image.width,
+      message.image.height,
+    ]
+      .filter((part) => part !== null && part !== undefined)
+      .join(" ");
+  }
+  return "";
+}
+
+/**
  * Builds the HTTP server. `options.now` injects a clock (ms) for tests and
  * `options.jwtSecret` overrides the signing secret.
  */
@@ -653,8 +673,14 @@ export function createApp(options = {}) {
           if (!conversation.participants.includes(me)) continue;
           const messages = conversation.messages ?? [];
           let latest = null;
+          let unreadCount = 0;
           for (const message of messages) {
             if (latest === null || message.seq > latest.seq) latest = message;
+            // A message is unread for the caller when someone else sent it and
+            // the caller is not yet in its read receipts (ZALO-24).
+            if (message.sender !== me && !message.readBy.includes(me)) {
+              unreadCount += 1;
+            }
           }
           list.push({
             id: conversation.id,
@@ -663,6 +689,7 @@ export function createApp(options = {}) {
             participants: [...conversation.participants],
             latestMessage: latest ? messageView(conversation, latest) : null,
             createdAt: conversation.createdAt,
+            unreadCount,
           });
         }
 
@@ -695,6 +722,25 @@ export function createApp(options = {}) {
           }
 
           const { searchParams } = new URL(req.url, "http://localhost");
+
+          // Search (ZALO-25): the caller's own messages containing the query,
+          // case-insensitive, newest first, at most 50. Image messages only
+          // match on their metadata (see `searchableText`).
+          const q = searchParams.get("q");
+          if (q !== null) {
+            const query = q.toLowerCase();
+            const results = (conversation.messages ?? [])
+              .filter(
+                (m) =>
+                  m.sender === me &&
+                  searchableText(m).toLowerCase().includes(query),
+              )
+              .sort((a, b) => b.seq - a.seq)
+              .slice(0, 50)
+              .map((m) => messageView(conversation, m));
+            return json(res, 200, { messages: results });
+          }
+
           let limit = 50;
           const limitRaw = searchParams.get("limit");
           if (limitRaw !== null) {
