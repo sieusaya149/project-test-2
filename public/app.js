@@ -188,6 +188,10 @@ const imageUploadMessage = document.getElementById("image-upload-message");
 const imageLightbox = document.getElementById("image-lightbox");
 const imageLightboxImg = document.getElementById("image-lightbox-img");
 const imageLightboxClose = document.getElementById("image-lightbox-close");
+const searchForm = document.getElementById("search-form");
+const searchInput = document.getElementById("search-input");
+const searchMessage = document.getElementById("search-message");
+const clearSearchButton = document.getElementById("clear-search");
 
 let currentConversation = null;
 let socket = null;
@@ -387,6 +391,7 @@ function showChatsLoggedOut() {
   renderedMessageIds.clear();
   revokeObjectUrls();
   clearImageMessage();
+  resetSearch();
 }
 
 async function loadConversations() {
@@ -478,6 +483,7 @@ async function openConversation(conversation) {
   messageInput.value = "";
   clearImageMessage();
   renderMessages(body.messages ?? []);
+  resetSearch();
   connectSocket();
   markConversationRead(conversation, body.messages ?? []);
   messageInput.focus();
@@ -518,6 +524,7 @@ function renderMessageItem(message) {
   const li = document.createElement("li");
   li.className = "message";
   li.dataset.seq = String(message.seq ?? 0);
+  li.dataset.id = message.id;
 
   const sender = document.createElement("span");
   sender.className = "message-sender";
@@ -555,6 +562,103 @@ function renderMessages(messages) {
     messageList.appendChild(renderMessageItem(message));
   }
 }
+
+// ---- Search messages in a conversation (ZALO-25) ----
+
+function clearSearchHighlights() {
+  for (const child of messageList.children) {
+    if (child.classList && typeof child.classList.remove === "function") {
+      child.classList.remove("is-highlight");
+    }
+  }
+}
+
+function showSearchMessage(text, isError) {
+  searchMessage.textContent = text;
+  searchMessage.classList.toggle("is-error", Boolean(isError));
+  searchMessage.hidden = false;
+}
+
+function clearSearchMessage() {
+  searchMessage.textContent = "";
+  searchMessage.classList.remove("is-error");
+  searchMessage.hidden = true;
+}
+
+function resetSearch() {
+  searchInput.value = "";
+  clearSearchMessage();
+  clearSearchHighlights();
+  clearSearchButton.hidden = true;
+}
+
+async function searchMessages(query) {
+  query = query.trim();
+  if (!currentConversation) return;
+  if (!query) {
+    // An empty query returns to the full, un-highlighted history.
+    resetSearch();
+    await openConversation(currentConversation);
+    return;
+  }
+
+  const res = await fetch(
+    `/conversations/${currentConversation.id}/messages?q=${encodeURIComponent(query)}`,
+    { headers: tokenHeader() },
+  );
+  if (res.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(PHONE_KEY);
+    showLoggedOut();
+    return;
+  }
+  if (res.status !== 200) {
+    showSearchMessage("Could not search the conversation.", true);
+    return;
+  }
+
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* non-JSON body */
+  }
+  const results = body?.messages ?? [];
+  clearSearchHighlights();
+
+  if (results.length === 0) {
+    clearSearchButton.hidden = true;
+    showSearchMessage("No matching messages.", false);
+    return;
+  }
+
+  // Highlight every match and jump to the most recent one.
+  const matchIds = new Set(results.map((m) => m.id));
+  let mostRecent = null;
+  for (const child of messageList.children) {
+    if (!matchIds.has(child.dataset?.id)) continue;
+    child.classList.add("is-highlight");
+    if (!mostRecent) mostRecent = child;
+  }
+  if (mostRecent && typeof mostRecent.scrollIntoView === "function") {
+    mostRecent.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  clearSearchButton.hidden = false;
+  showSearchMessage(
+    `${results.length} matching ${results.length === 1 ? "message" : "messages"}.`,
+    false,
+  );
+}
+
+searchForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  searchMessages(searchInput.value);
+});
+
+clearSearchButton.addEventListener("click", () => {
+  searchInput.value = "";
+  searchMessages("");
+});
 
 // ---- Send images in the chat (ZALO-17) ----
 
