@@ -194,6 +194,11 @@ let socket = null;
 const renderedMessageIds = new Set();
 // Blob URLs created for image thumbnails/full-size views (ZALO-17).
 const activeObjectUrls = new Set();
+// Unread-count badges on the Chats list, keyed by conversation id (ZALO-24).
+const conversationBadges = new Map();
+// Highest message `seq` already reflected in the rendered list, so buffered
+// messages delivered right after a connect are not double-counted.
+const conversationHighWater = new Map();
 
 // Opens (or reuses) one WebSocket per logged-in session so this tab receives
 // live messages without reloading. `socket` keeps the current connection.
@@ -240,6 +245,7 @@ function handleSocketEvent(parsed) {
   if (!parsed || typeof parsed !== "object") return;
   if (parsed.type === "message") {
     appendMessage(parsed.message);
+    noteUnreadMessage(parsed.message);
   } else if (parsed.type === "status") {
     // The sender's own message is confirmed via a `status` acknowledgement,
     // so show it in the thread once the server has accepted it.
@@ -247,6 +253,53 @@ function handleSocketEvent(parsed) {
       appendMessage(parsed.message);
     }
   }
+}
+
+// Sends a read receipt over the socket (best-effort when it is not open yet).
+function sendRead(conversationId, messageId) {
+  const ws = socket;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "read", conversationId, messageId }));
+}
+
+/**
+ * Keeps the unread badges accurate as messages arrive live: an incoming
+ * message in the open chat is read right away, while one in any other chat
+ * bumps that conversation's badge by one.
+ */
+function noteUnreadMessage(message) {
+  if (!message || !message.conversationId) return;
+  if (message.sender === getPhone()) return;
+  if (currentConversation && message.conversationId === currentConversation.id) {
+    sendRead(message.conversationId, message.id);
+    return;
+  }
+  bumpUnreadBadge(message);
+}
+
+function bumpUnreadBadge(message) {
+  const { conversationId, seq } = message;
+  const highWater = conversationHighWater.get(conversationId);
+  // A buffered message delivered right after (re)connecting was already counted
+  // in the last GET's unreadCount, so only newer sequences bump the badge.
+  if (highWater !== undefined && seq !== undefined && seq <= highWater) return;
+
+  const badge = conversationBadges.get(conversationId);
+  if (badge) {
+    const count = Number.parseInt(badge.textContent, 10) || 0;
+    badge.textContent = String(count + 1);
+    badge.hidden = false;
+  }
+  if (seq !== undefined && (highWater === undefined || seq > highWater)) {
+    conversationHighWater.set(conversationId, seq);
+  }
+}
+
+function clearUnreadBadge(conversationId) {
+  const badge = conversationBadges.get(conversationId);
+  if (!badge) return;
+  badge.textContent = "";
+  badge.hidden = true;
 }
 
 function appendMessage(message) {
@@ -328,6 +381,8 @@ function showChatsLoggedOut() {
   chatsListView.hidden = true;
   chatView.hidden = true;
   conversationList.replaceChildren();
+  conversationBadges.clear();
+  conversationHighWater.clear();
   messageList.replaceChildren();
   renderedMessageIds.clear();
   revokeObjectUrls();
@@ -354,6 +409,8 @@ function renderConversations(conversations) {
   chatsListView.hidden = false;
   chatView.hidden = true;
   conversationList.replaceChildren();
+  conversationBadges.clear();
+  conversationHighWater.clear();
 
   if (conversations.length === 0) {
     const empty = document.createElement("li");
@@ -383,7 +440,20 @@ function renderConversations(conversations) {
       conversation.latestMessage?.createdAt ?? conversation.createdAt,
     );
 
-    li.append(title, preview, time);
+    const badge = document.createElement("span");
+    badge.className = "conversation-unread";
+    badge.hidden = !(conversation.unreadCount > 0);
+    badge.textContent = conversation.unreadCount > 0
+      ? String(conversation.unreadCount)
+      : "";
+    conversationBadges.set(conversation.id, badge);
+    conversationHighWater.set(conversation.id, conversation.latestMessage?.seq ?? 0);
+
+    const meta = document.createElement("div");
+    meta.className = "conversation-meta";
+    meta.append(time, badge);
+
+    li.append(title, preview, meta);
     li.addEventListener("click", () => openConversation(conversation));
     conversationList.appendChild(li);
   }
@@ -409,7 +479,39 @@ async function openConversation(conversation) {
   clearImageMessage();
   renderMessages(body.messages ?? []);
   connectSocket();
+  markConversationRead(conversation, body.messages ?? []);
   messageInput.focus();
+}
+
+/**
+ * Clears the unread badge for the opened conversation and records read receipts
+ * for every message the caller has not read yet, reusing the ZALO-7 read flow.
+ */
+function markConversationRead(conversation, messages) {
+  clearUnreadBadge(conversation.id);
+  const phone = getPhone();
+  const unread = messages.filter(
+    (message) =>
+      message.sender !== phone && !(message.readBy ?? []).includes(phone),
+  );
+  if (unread.length === 0) return;
+
+  const sendReads = () => {
+    const ws = socket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const message of unread) {
+      ws.send(
+        JSON.stringify({
+          type: "read",
+          conversationId: conversation.id,
+          messageId: message.id,
+        }),
+      );
+    }
+  };
+
+  if (socket && socket.readyState === WebSocket.OPEN) sendReads();
+  else if (socket) socket.addEventListener("open", sendReads, { once: true });
 }
 
 function renderMessageItem(message) {
@@ -817,6 +919,9 @@ friendRequestForm.addEventListener("submit", async (event) => {
 globalThis.__zaloChat = {
   appendMessage,
   renderMessages,
+  renderConversations,
+  noteUnreadMessage,
+  clearUnreadBadge,
   get currentConversation() {
     return currentConversation;
   },
