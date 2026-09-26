@@ -432,7 +432,10 @@ export function createApp(options = {}) {
         return sendWsError(conn, "text must be a non-empty string");
       }
       if (text.length > MAX_MESSAGE_LENGTH) {
-        return sendWsError(conn, "text too long");
+        return sendWsError(
+          conn,
+          `Message is too long (max ${MAX_MESSAGE_LENGTH} characters)`,
+        );
       }
       message = {
         id: randomUUID(),
@@ -851,7 +854,9 @@ export function createApp(options = {}) {
             return json(res, 400, { error: "text must be a non-empty string" });
           }
           if (text.length > MAX_MESSAGE_LENGTH) {
-            return json(res, 400, { error: "text too long" });
+            return json(res, 400, {
+              error: `Message is too long (max ${MAX_MESSAGE_LENGTH} characters)`,
+            });
           }
           if (message.deleted) {
             return json(res, 409, { error: "cannot edit a deleted message" });

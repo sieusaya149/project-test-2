@@ -297,6 +297,9 @@ body {
   padding: 8px 12px;
   background: var(--bg);
   border-radius: 8px;
+  /* Long words must wrap inside the bubble instead of stretching it (ZALO-26). */
+  max-width: 100%;
+  min-width: 0;
 }
 
 .message-sender {

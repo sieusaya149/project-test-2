@@ -186,6 +186,7 @@ const typingIndicator = document.getElementById("typing-indicator");
 const imageInput = document.getElementById("image-input");
 const attachButton = document.getElementById("attach-button");
 const imageUploadMessage = document.getElementById("image-upload-message");
+const messageError = document.getElementById("message-error");
 const imageLightbox = document.getElementById("image-lightbox");
 const imageLightboxImg = document.getElementById("image-lightbox-img");
 const imageLightboxClose = document.getElementById("image-lightbox-close");
@@ -345,6 +346,10 @@ function handleSocketEvent(parsed) {
     if (parsed.message && parsed.message.sender === getPhone()) {
       appendMessage(parsed.message);
     }
+  } else if (parsed.type === "error") {
+    // Surface the server's refusal (e.g. a message over 4000 characters) in
+    // the chat window so the user sees the clear error (ZALO-26).
+    showChatError(parsed.error ?? parsed.message ?? "Could not send the message.");
   } else if (parsed.type === "typing") {
     showTypingIndicator(parsed);
   } else if (parsed.type === "message:edited") {
@@ -352,6 +357,18 @@ function handleSocketEvent(parsed) {
   } else if (parsed.type === "message:deleted") {
     markMessageDeleted(parsed.conversationId, parsed.messageId);
   }
+}
+
+function showChatError(text) {
+  messageError.textContent = text;
+  messageError.classList.add("is-error");
+  messageError.hidden = false;
+}
+
+function clearChatError() {
+  messageError.textContent = "";
+  messageError.classList.remove("is-error");
+  messageError.hidden = true;
 }
 
 // Sends a read receipt over the socket (best-effort when it is not open yet).
@@ -584,6 +601,7 @@ async function openConversation(conversation) {
   chatView.hidden = false;
   messageInput.value = "";
   clearImageMessage();
+  clearChatError();
   renderMessages(body.messages ?? []);
   resetSearch();
   connectSocket();
@@ -1060,6 +1078,7 @@ messageForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = messageInput.value.trim();
   if (!text || !currentConversation) return;
+  clearChatError();
   connectSocket();
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(
