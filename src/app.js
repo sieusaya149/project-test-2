@@ -359,7 +359,10 @@ export function createApp(options = {}) {
         return sendWsError(conn, "text must be a non-empty string");
       }
       if (text.length > MAX_MESSAGE_LENGTH) {
-        return sendWsError(conn, "text too long");
+        return sendWsError(
+          conn,
+          `Message is too long (max ${MAX_MESSAGE_LENGTH} characters)`,
+        );
       }
       message = {
         id: randomUUID(),
